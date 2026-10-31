@@ -1,7 +1,7 @@
 """
 Main Application Orchestrator for Deriv Digit Trading Bot.
 
-Supports Three Execution Modes:
+Supports Three Execution Modes with 2-Trade Capped Match/Differs Strategy:
 1. Live Trading (python main.py):
    - Real Deriv market stream (symbols, momentum, ticks).
    - Real contracts placed on Deriv account with real funds.
@@ -70,13 +70,14 @@ class DerivTradingBot:
         self.config = config
         self.logger = logging.getLogger("DerivBot")
         
-        # 1. Strategy Engine (Dynamic Match/Differs State Machine)
+        # 1. Strategy Engine (Dynamic Match/Differs State Machine with 2-Trade Cap)
         self.strategy = StrategyEngine(
             buffer_size=config.DIGIT_WINDOW_SIZE,
             threshold_percent=config.DIGIT_THRESHOLD_PERCENT,
             strategy_mode=config.STRATEGY_MODE,
             blacklist_duration_trades=config.DIGIT_BLACKLIST_TRADES,
-            dynamic_mode_switch=config.DYNAMIC_MODE_SWITCH
+            dynamic_mode_switch=config.DYNAMIC_MODE_SWITCH,
+            max_match_attempts=config.MATCH_MAX_ATTEMPTS
         )
         
         # 2. Risk Manager
@@ -135,12 +136,13 @@ class DerivTradingBot:
         self.logger.info("=" * 80)
         self.logger.info("🚀 DERIV QUANTITATIVE DIGIT TRADING BOT")
         self.logger.info(f"Execution Mode:     [{exec_mode}]")
-        self.logger.info(f"Strategy Pipeline:  DIFFERS primary -> on 1 loss: MATCH recovery -> on 1 win: DIFFERS")
+        self.logger.info(f"Strategy Pipeline:  DIFFERS primary -> on 1 loss: MATCH recovery (Max {self.config.MATCH_MAX_ATTEMPTS} trades cap)")
+        self.logger.info(f"Recovery Pivot:     MATCH recovery -> on WIN or {self.config.MATCH_MAX_ATTEMPTS} LOSSES: switches back to DIFFERS")
         self.logger.info(f"Initial State:      [{self.strategy.strategy_mode}]")
         self.logger.info(f"Candidate Markets:  {list(self.config.SCANNER_SYMBOLS)}")
         self.logger.info(f"Anomaly Threshold:  >= {self.config.DIGIT_THRESHOLD_PERCENT:.1f}% in {self.config.DIGIT_WINDOW_SIZE} ticks")
         self.logger.info(f"Anti-Revenge Guard: {self.config.DIGIT_BLACKLIST_TRADES} trades quarantine on losing digits")
-        self.logger.info(f"Stake Management:   Flat ${self.config.STAKE_AMOUNT:.2f} {self.config.CURRENCY} (No 11x Martingale)")
+        self.logger.info(f"Stake Management:   Flat ${self.config.STAKE_AMOUNT:.2f} {self.config.CURRENCY} (Zero Martingale)")
         self.logger.info(f"Hard Boundaries:    Take Profit: +${self.config.DAILY_TAKE_PROFIT:.2f} | Stop Loss: -${self.config.DAILY_STOP_LOSS:.2f}")
         self.logger.info("=" * 80)
 
@@ -154,11 +156,7 @@ class DerivTradingBot:
             await self._run_live_mode()
 
     async def _run_live_mode(self) -> None:
-        """
-        Execute live gateway connection (used by both Live Mode and Real Deriv Simulation).
-        Streams genuine Deriv ticks, evaluates live momentum, and either dispatches real trades
-        or paper-trades locally.
-        """
+        """Execute live gateway connection (used by both Live Mode and Real Deriv Simulation)."""
         try:
             self.config.validate()
         except ValueError as err:
@@ -399,6 +397,7 @@ def parse_arguments() -> argparse.Namespace:
     
     # Strategy & parameters
     parser.add_argument("--mode", choices=["DIFFERS", "MATCH"], help="Initial Mode (default: DIFFERS)")
+    parser.add_argument("--match-cap", type=int, default=2, help="Max Match trades before reverting to Differs (default: 2)")
     parser.add_argument("--symbol", type=str, help="Initial Volatility Index (e.g. R_100)")
     parser.add_argument("--stake", type=float, help="Base stake amount in USD (default: 0.35)")
     parser.add_argument("--threshold", type=float, help="Statistical Anomaly % threshold (default: 18.0)")
@@ -423,6 +422,8 @@ async def main() -> None:
 
     if args.mode:
         overrides["STRATEGY_MODE"] = args.mode
+    if args.match_cap:
+        overrides["MATCH_MAX_ATTEMPTS"] = args.match_cap
     if args.symbol:
         overrides["SYMBOL"] = args.symbol
     if args.stake:

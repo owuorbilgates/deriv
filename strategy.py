@@ -1,17 +1,17 @@
 """
 Strategy Engine Module for Deriv Digit Trading Bot.
 
-Implements the Dynamic Match/Differs State Machine:
-1. Normal Phase (DIFFERS):
-   - Starts in Differs mode executing DIGITDIFF on statistically overrepresented digits (>= 18.0%).
+Implements the Dynamic Match/Differs State Machine with 2-Trade Match Cap:
+1. Primary Normal Phase (DIFFERS):
+   - Executes DIGITDIFF on statistically overrepresented digits (>= 18.0%).
    - Takes small frequent wins with flat $0.35 stake.
-2. Drawdown Recovery Phase (MATCH):
-   - If a loss occurs in Differs mode, the bot immediately switches to MATCH mode.
+2. Drawdown Recovery Phase (MATCH - Capped at 2 Trades):
+   - If a loss occurs in Differs mode, the bot switches to MATCH mode.
    - Quarantines the losing digit in a 10-trade Anti-Revenge Blacklist.
-   - Trades DIGITMATCH with a flat $0.35 stake (ZERO Martingale).
-   - High positive expectancy with ~810%-850% payout ($3.15 profit) erases the loss.
-3. Normal Phase Restoration:
-   - Upon a win in MATCH mode, the bot automatically switches back to DIFFERS mode!
+   - Allows up to TWO (2) Match trades with a flat $0.35 stake (ZERO Martingale).
+3. State Restoration (Back to DIFFERS):
+   - If ANY Match trade WINS (either trade 1 or trade 2): immediately switches back to DIFFERS.
+   - If BOTH Match trades LOSE (2-trade cap reached): immediately switches back to DIFFERS to prevent bleeding!
 """
 
 from collections import Counter, deque
@@ -53,7 +53,7 @@ class StrategySignal:
 
 class StrategyEngine:
     """
-    Quantitative Strategy Engine with Dynamic Match/Differs State Machine.
+    Quantitative Strategy Engine with 2-Trade Capped Match/Differs State Machine.
     """
 
     def __init__(
@@ -62,7 +62,8 @@ class StrategyEngine:
         threshold_percent: float = 18.0,
         strategy_mode: str = "DIFFERS",
         blacklist_duration_trades: int = 10,
-        dynamic_mode_switch: bool = True
+        dynamic_mode_switch: bool = True,
+        max_match_attempts: int = 2
     ):
         """
         Initialize strategy engine.
@@ -72,13 +73,18 @@ class StrategyEngine:
             threshold_percent: Minimum occurrence % to trigger (default: 18.0%).
             strategy_mode: Starting mode ("DIFFERS" or "MATCH").
             blacklist_duration_trades: Number of trades to quarantine a losing digit.
-            dynamic_mode_switch: If True, switches to MATCH on loss, and back to DIFFERS on win.
+            dynamic_mode_switch: If True, switches to MATCH on loss, and back to DIFFERS on win or 2 losses.
+            max_match_attempts: Maximum number of trades permitted in MATCH mode before reverting to DIFFERS (default: 2).
         """
         self.buffer_size = buffer_size
         self.threshold_percent = threshold_percent
         self.strategy_mode = strategy_mode.upper()
         self.blacklist_duration = blacklist_duration_trades
         self.dynamic_mode_switch = dynamic_mode_switch
+        self.max_match_attempts = max_match_attempts
+        
+        # Counter for trades executed while in MATCH mode
+        self.match_attempts: int = 0
         
         self.tick_history: Deque[TickData] = deque(maxlen=buffer_size)
         
@@ -112,9 +118,12 @@ class StrategyEngine:
         
         1. Decrements active blacklist counters.
         2. If status == 'lost': quarantines the barrier digit for blacklist_duration trades.
-        3. Dynamic State Machine Transitions:
-           - DIFFERS + Loss -> Switches to MATCH mode (Flat stake recovery, No Martingale).
-           - MATCH + Win -> Switches back to DIFFERS mode!
+        3. Dynamic State Machine Transitions (2-Trade Match Cap Protocol):
+           - In DIFFERS: On 1 loss -> switches to MATCH (match_attempts = 0).
+           - In MATCH:
+             - If WON on trade 1 or 2 -> switches back to DIFFERS immediately!
+             - If LOST on trade 1 -> increments counter to 1, remains in MATCH for trade 2.
+             - If LOST on trade 2 -> reaches 2-trade cap, switches back to DIFFERS immediately!
         """
         # Decrement existing blacklists
         expired_digits = []
@@ -134,20 +143,37 @@ class StrategyEngine:
                 f"next {self.blacklist_duration} trades to prevent revenge trading into a hot cluster."
             )
 
-        # Dynamic State Machine Transitions
+        # Dynamic State Machine Transitions with 2-Trade Match Cap
         if self.dynamic_mode_switch:
             if self.strategy_mode == "DIFFERS" and status == "lost":
+                self.match_attempts = 0
                 logger.warning(
                     f"🔄 [STRATEGY PIVOT: DIFFERS -> MATCH] Differs contract lost! "
-                    f"Switching to Trend-Following MATCH mode (Flat stake, No Martingale) to recover loss via ~9.1x payout."
+                    f"Switching to MATCH recovery mode (Max {self.max_match_attempts} trades, Flat stake $0.35, No Martingale)."
                 )
                 self.strategy_mode = "MATCH"
-            elif self.strategy_mode == "MATCH" and status == "won":
-                logger.info(
-                    f"🎉 [RECOVERY COMPLETE: MATCH -> DIFFERS] Match contract WON! "
-                    f"Loss recovered with positive payoff. Switching back to primary DIFFERS mode."
-                )
-                self.strategy_mode = "DIFFERS"
+            elif self.strategy_mode == "MATCH":
+                self.match_attempts += 1
+                if status == "won":
+                    logger.info(
+                        f"🎉 [RECOVERY COMPLETE: MATCH -> DIFFERS] Match contract WON on trade {self.match_attempts}/{self.max_match_attempts}! "
+                        f"Loss recovered with positive payoff. Switching back to primary DIFFERS mode."
+                    )
+                    self.match_attempts = 0
+                    self.strategy_mode = "DIFFERS"
+                else:
+                    if self.match_attempts >= self.max_match_attempts:
+                        logger.warning(
+                            f"⚠️ [MATCH CAP REACHED: MATCH -> DIFFERS] Reached 2-trade limit ({self.match_attempts}/{self.max_match_attempts}) in Match mode without win. "
+                            f"Capping drawdown and switching back to primary DIFFERS mode."
+                        )
+                        self.match_attempts = 0
+                        self.strategy_mode = "DIFFERS"
+                    else:
+                        logger.info(
+                            f"ℹ️ [MATCH TRADE {self.match_attempts}/{self.max_match_attempts}] Match trade lost. "
+                            f"1 attempt remaining before returning to DIFFERS mode."
+                        )
 
     def on_new_tick(self, symbol: str, quote: float, pip_size: int, epoch: int) -> Tuple[TickData, StrategySignal]:
         """Process incoming tick, update history, and evaluate strategy."""
@@ -167,12 +193,18 @@ class StrategyEngine:
         """
         Evaluate Digit Distribution over the rolling window according to active state (DIFFERS or MATCH).
         """
+        mode_tag = (
+            f"MATCH ({self.match_attempts + 1}/{self.max_match_attempts})"
+            if self.strategy_mode == "MATCH"
+            else "DIFFERS"
+        )
+
         if len(tick_history) < self.buffer_size:
             return StrategySignal(
                 signal_type=SignalType.WAIT,
                 predicted_barrier=0,
                 confidence=0.0,
-                reason=f"[{self.strategy_mode}] Accumulating tick history ({len(tick_history)}/{self.buffer_size} ticks required)"
+                reason=f"[{mode_tag}] Accumulating tick history ({len(tick_history)}/{self.buffer_size} ticks required)"
             )
 
         digits: List[int] = [t.last_digit for t in tick_history]
@@ -201,7 +233,7 @@ class StrategyEngine:
             if digit in self.digit_blacklist:
                 rem = self.digit_blacklist[digit]
                 logger.debug(
-                    f"[{self.strategy_mode}] Skipping Digit [{digit}] ({pct:.1f}%): quarantined in blacklist ({rem} trades left)."
+                    f"[{mode_tag}] Skipping Digit [{digit}] ({pct:.1f}%): quarantined in blacklist ({rem} trades left)."
                 )
                 continue
 
@@ -221,7 +253,7 @@ class StrategyEngine:
                     predicted_barrier=top_d,
                     confidence=0.0,
                     reason=(
-                        f"[{self.strategy_mode}] Top Digit [{top_d}] ({top_p:.1f}%) is quarantined in Anti-Revenge Blacklist "
+                        f"[{mode_tag}] Top Digit [{top_d}] ({top_p:.1f}%) is quarantined in Anti-Revenge Blacklist "
                         f"({rem} trades left). Avoiding hot cluster."
                     ),
                     distribution=distribution
@@ -230,14 +262,14 @@ class StrategyEngine:
         if target_digit is not None and target_pct >= self.threshold_percent:
             confidence = min(0.99, target_pct / 100.0)
 
-            # PHASE 2: Trend-Following Momentum Match (Recovery Phase)
+            # PHASE 2: Trend-Following Momentum Match (Capped at 2 Trades)
             if self.strategy_mode == "MATCH":
                 return StrategySignal(
                     signal_type=SignalType.DIGITMATCH,
                     predicted_barrier=target_digit,
                     confidence=confidence,
                     reason=(
-                        f"🔥 [MATCH RECOVERY] Digit '{target_digit}' is hot ({target_count}/{total_ticks}, "
+                        f"🔥 [{mode_tag} RECOVERY] Digit '{target_digit}' is hot ({target_count}/{total_ticks}, "
                         f"{target_pct:.1f}% >= {self.threshold_percent:.1f}%). Betting WITH streak on DIGITMATCH (Flat $0.35, No Martingale)."
                     ),
                     distribution=distribution
@@ -263,7 +295,7 @@ class StrategyEngine:
             predicted_barrier=most_common_d,
             confidence=0.0,
             reason=(
-                f"[{self.strategy_mode}] No anomaly detected: Highest Digit '{most_common_d}' at "
+                f"[{mode_tag}] No anomaly detected: Highest Digit '{most_common_d}' at "
                 f"{pct:.1f}% < {self.threshold_percent:.1f}% threshold."
             ),
             distribution=distribution
@@ -271,8 +303,13 @@ class StrategyEngine:
 
     def get_distribution_summary(self) -> str:
         """Return formatted distribution summary showing active mode and blacklist."""
+        mode_tag = (
+            f"MATCH ({self.match_attempts + 1}/{self.max_match_attempts})"
+            if self.strategy_mode == "MATCH"
+            else "DIFFERS"
+        )
         if not self.tick_history:
-            return f"[{self.strategy_mode}] No ticks recorded yet"
+            return f"[{mode_tag}] No ticks recorded yet"
         
         digits = [t.last_digit for t in self.tick_history]
         total = len(digits)
@@ -294,4 +331,4 @@ class StrategyEngine:
             bl_str = ", ".join([f"{k} ({v} left)" for k, v in self.digit_blacklist.items()])
             bl_info = f" | Blacklist: [{bl_str}]"
             
-        return f"[{self.strategy_mode}] Digits ({total} ticks): [{' '.join(items)}]{bl_info}"
+        return f"[{mode_tag}] Digits ({total} ticks): [{' '.join(items)}]{bl_info}"

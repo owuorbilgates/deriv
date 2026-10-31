@@ -1,12 +1,10 @@
 # Deriv Dynamic Match/Differs Quantitative Trading Bot
 
-An automated quantitative trading system designed for **Deriv Volatility Indices** executing a **Dynamic Match/Differs Strategy** that eliminates Martingale account blowouts through asymmetric payout recovery.
+An automated quantitative trading system designed for **Deriv Volatility Indices** executing a **Dynamic Match/Differs Strategy with a 2-Trade Match Cap** that eliminates Martingale blowouts and caps recovery drawdown.
 
 ---
 
 ## Three Execution Modes Available
-
-You can run the bot in any of the 3 modes below depending on your goal:
 
 | Execution Mode | Command | Real Deriv Charts & Ticks? | Real Money at Risk? | Description |
 | :--- | :--- | :---: | :---: | :--- |
@@ -16,7 +14,7 @@ You can run the bot in any of the 3 modes below depending on your goal:
 
 ---
 
-## Strategy Architecture: Dynamic Match/Differs State Machine
+## Strategy Architecture: Dynamic Match/Differs State Machine (2-Trade Match Cap)
 
 ```
                         ┌────────────────────────────────────────────────────────┐
@@ -27,14 +25,15 @@ You can run the bot in any of the 3 modes below depending on your goal:
          │  - Primary normal trading    ├─────────────────────────►│  - Recovery trading         │
          │  - Contract: DIGITDIFF       │   (NO 11x Martingale!)   │  - Contract: DIGITMATCH      │
          │  - Flat Stake: $0.35 USD     │                          │  - Flat Stake: $0.35 USD     │
-         │  - Frequent small wins       │                          │  - Asymmetric 9.1x Payout    │
+         │  - Frequent small wins       │                          │  - STRICT 2-TRADE CAP!       │
          └──────────────┬───────────────┘                          └─────────────┬────────────────┘
                         ▲                                                        │
-                        │                   On 1 Win in MATCH                    │
-                        └────────────────────────────────────────────────────────┘
+                        │       1. On 1 WIN in Match (Recovery Won!)             │
+                        └───────OR───────────────────────────────────────────────┘
+                                2. On 2 LOSSES in Match (Cap Reached, Exit Drawdown)
 ```
 
-1. **Primary Phase: Differs (`DIGITDIFF`)**
+1. **Primary Normal Phase: Differs (`DIGITDIFF`)**
    * Starts in Differs mode.
    * Scans candidate markets (`R_10` to `R_100`) via the 5-minute momentum rule.
    * Trades overrepresented digits ($\ge 18\%$) with flat **$\$0.35\text{ USD}$**.
@@ -44,11 +43,11 @@ You can run the bot in any of the 3 modes below depending on your goal:
    * **Mechanism:** Instead of applying an $11\times$ Martingale multiplier ($-\$3.85$), the bot **switches to Match mode**.
    * **Anti-Revenge Guard:** Quarantines the losing digit in a 10-trade blacklist to prevent betting into the same cluster.
    * **Stake:** Strictly flat **$\$0.35\text{ USD}$ (Zero Martingale)**.
-   * **Expectancy:** When a hot digit hits, `DIGITMATCH` pays $\sim 9.1\times$ total return ($+\$2.80\text{ to }+\$3.15\text{ USD}$ profit), completely erasing the prior loss in a single trade.
 
-3. **Restoration Phase**
-   * **Trigger:** Upon any winning trade in Match mode.
-   * **Action:** The bot automatically transitions back to primary **Differs mode** with positive net PnL!
+3. **Strict 2-Trade Cap Protocol:**
+   * **Win on Trade 1 or Trade 2:** Match payout ($\sim 9.1\times$ return, $+\$2.80\text{ to }+\$3.15\text{ profit}$) recovers the Differs loss; **immediately switches back to Differs mode**!
+   * **Loss on Trade 1:** Bot attempts a second Match trade (`2/2`).
+   * **Loss on Trade 2 (Cap Reached):** Bot terminates Match recovery immediately, caps drawdown to at most 2 Match trades ($-\$0.70$), and **switches back to Differs mode**!
 
 ---
 
@@ -70,6 +69,7 @@ DERIV_SCANNER_INTERVAL=60
 # Dynamic Strategy Settings
 DERIV_STRATEGY_MODE=DIFFERS
 DERIV_DYNAMIC_MODE_SWITCH=true
+DERIV_MATCH_MAX_ATTEMPTS=2
 DERIV_DURATION=1
 DERIV_STAKE_AMOUNT=0.35
 DERIV_CURRENCY=USD
@@ -91,24 +91,16 @@ DERIV_PAPER_BALANCE=100.00
 
 ## Commands to Run
 
-### 1. Real Deriv Simulation (Live Deriv Ticks & Charts, Local Orders)
 ```powershell
+# 1. Real Deriv Simulation (Real ticks, local paper orders)
 python main.py --real-sim
-# or
-python main.py --paper
-```
 
-### 2. Offline Simulation (Synthetic Ticks, No Internet Required)
-```powershell
+# 2. Offline Simulation (Synthetic ticks, no internet required)
 python main.py --sim
-```
 
-### 3. Live Trading (Real Money Contracts on Deriv Account)
-```powershell
+# 3. Live Trading (Real funds on Deriv account)
 python main.py
-```
 
-### 4. Run Unit Test Suite
-```powershell
-python -m unittest deriv/test_bot.py
+# 4. Optional: Override Match Cap at runtime (e.g. 2 trades)
+python main.py --match-cap 2
 ```

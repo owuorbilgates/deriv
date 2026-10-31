@@ -38,10 +38,6 @@ class TradingConfig:
     # -------------------------------------------------------------------------
     # Execution Modes
     # -------------------------------------------------------------------------
-    # 1. LIVE MODE: Default (python main.py) -> Real Deriv ticks + Real Deriv orders
-    # 2. REAL DERIV SIMULATION / PAPER TRADING (python main.py --real-sim or --paper):
-    #    Connects with API token & App ID, checks REAL Deriv charts & live ticks, but orders are LOCAL on machine.
-    # 3. OFFLINE SIMULATION (python main.py --sim): Completely offline synthetic random walk.
     PAPER_TRADING_MODE: bool = os.getenv("DERIV_PAPER_TRADING", "false").lower() in ("1", "true", "yes")
     SIMULATION_MODE: bool = os.getenv("DERIV_SIMULATION_MODE", "false").lower() in ("1", "true", "yes")
 
@@ -59,6 +55,9 @@ class TradingConfig:
     # -------------------------------------------------------------------------
     STRATEGY_MODE: str = os.getenv("DERIV_STRATEGY_MODE", "DIFFERS").upper()
     DYNAMIC_MODE_SWITCH: bool = os.getenv("DERIV_DYNAMIC_MODE_SWITCH", "true").lower() in ("1", "true", "yes")
+    
+    # In Match recovery mode, strictly cap at 2 trades then switch back to Differs
+    MATCH_MAX_ATTEMPTS: int = int(os.getenv("DERIV_MATCH_MAX_ATTEMPTS", "2"))
     
     # Rolling tick history window size
     DIGIT_WINDOW_SIZE: int = int(os.getenv("DERIV_DIGIT_WINDOW_SIZE", "100"))
@@ -123,6 +122,8 @@ class TradingConfig:
             raise ValueError("DIGIT_WINDOW_SIZE must be at least 10 ticks.")
         if self.DIGIT_THRESHOLD_PERCENT < 11.0:
             raise ValueError("DIGIT_THRESHOLD_PERCENT must be at least 11.0%.")
+        if self.MATCH_MAX_ATTEMPTS < 1:
+            raise ValueError("MATCH_MAX_ATTEMPTS must be at least 1.")
 
 
 CONFIG = TradingConfig()

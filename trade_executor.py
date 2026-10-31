@@ -3,7 +3,7 @@ Trade Execution Module for Deriv Digit Trading Bot.
 
 Constructs Deriv API trade contracts, dispatches orders, enforces locks,
 monitors live contract lifecycles via proposal_open_contract, and reports settlement
-outcomes to Risk Manager.
+outcomes to Risk Manager and Strategy Engine (for the Anti-Revenge Blacklist protocol).
 """
 
 import asyncio
@@ -14,17 +14,23 @@ from typing import Any, Dict, Optional
 from config import TradingConfig
 from deriv_client import DerivClient
 from risk_manager import RiskManager, TradeOutcome
-from strategy import SignalType, StrategySignal, TickData
+from strategy import SignalType, StrategyEngine, StrategySignal, TickData
 
 logger = logging.getLogger("TradeExecutor")
 
 
 class TradeExecutor:
     """
-    Coordinates contract purchase, lifecycle monitoring, and settlement.
+    Coordinates contract purchase, lifecycle monitoring, settlement, and strategy feedback.
     """
 
-    def __init__(self, client: DerivClient, risk_manager: RiskManager, config: TradingConfig):
+    def __init__(
+        self,
+        client: DerivClient,
+        risk_manager: RiskManager,
+        config: TradingConfig,
+        strategy: Optional[StrategyEngine] = None
+    ):
         """
         Initialize Trade Executor.
         
@@ -32,10 +38,12 @@ class TradeExecutor:
             client: Connected Deriv WebSocket client.
             risk_manager: RiskManager instance.
             config: TradingConfig instance.
+            strategy: StrategyEngine instance (for blacklisting losing digits).
         """
         self.client = client
         self.risk_manager = risk_manager
         self.config = config
+        self.strategy = strategy
 
         # Pending contract tracking: {contract_id: contract_context_dict}
         self._pending_contracts: Dict[int, Dict[str, Any]] = {}
@@ -46,14 +54,6 @@ class TradeExecutor:
     async def execute_signal(self, signal: StrategySignal, current_tick: TickData, target_symbol: Optional[str] = None) -> bool:
         """
         Evaluate and execute a trading signal.
-        
-        Args:
-            signal: Generated StrategySignal.
-            current_tick: Latest TickData context.
-            target_symbol: Active Volatility Index symbol.
-            
-        Returns:
-            bool: True if order was dispatched, False otherwise.
         """
         if signal.signal_type == SignalType.WAIT:
             return False
@@ -121,12 +121,7 @@ class TradeExecutor:
             return False
 
     async def handle_contract_update(self, msg: Dict[str, Any]) -> None:
-        """
-        Process live contract status updates from Deriv server (proposal_open_contract).
-        
-        Args:
-            msg: JSON payload from Deriv containing contract state.
-        """
+        """Process live contract status updates from Deriv server."""
         poc = msg.get("proposal_open_contract") if isinstance(msg, dict) and "proposal_open_contract" in msg else msg
         if not poc or not isinstance(poc, dict):
             return
@@ -136,37 +131,27 @@ class TradeExecutor:
             return
 
         is_sold = bool(poc.get("is_sold", 0))
-        status = poc.get("status")  # "open", "won", "lost"
-        current_spot = poc.get("current_spot")
-        tick_count = poc.get("tick_count", 0)
+        status = poc.get("status")
 
-        logger.debug(
-            f"Contract #{contract_id} update: Status={status} | "
-            f"Tick {tick_count}/{self.config.DURATION} | Spot={current_spot}"
-        )
-
-        # Check for settlement
         if is_sold or status in ("won", "lost"):
             await self._settle_contract(contract_id, poc)
 
     async def _settle_contract(self, contract_id: int, poc: Dict[str, Any]) -> None:
-        """
-        Parse final contract results, release risk lock, and update metrics.
-        """
+        """Parse contract results, release risk lock, and notify strategy of outcome."""
         ctx = self._pending_contracts.pop(contract_id, {})
         status = poc.get("status", "lost")
         profit = float(poc.get("profit", 0.0))
         payout = float(poc.get("payout", 0.0))
         stake = float(poc.get("buy_price", ctx.get("stake", self.config.STAKE_AMOUNT)))
         barrier = ctx.get("barrier", self.config.DEFAULT_BARRIER)
+        contract_type = ctx.get("contract_type", self.config.DEFAULT_CONTRACT_TYPE)
         
-        # Extract exit digit
         exit_tick_str = str(poc.get("exit_tick_display_value", poc.get("exit_tick", "")))
         exit_digit = int(exit_tick_str[-1]) if exit_tick_str and exit_tick_str[-1].isdigit() else None
 
         outcome = TradeOutcome(
             contract_id=contract_id,
-            contract_type=ctx.get("contract_type", self.config.DEFAULT_CONTRACT_TYPE),
+            contract_type=contract_type,
             symbol=ctx.get("symbol", self.config.SYMBOL),
             stake=stake,
             payout=payout,
@@ -180,16 +165,19 @@ class TradeExecutor:
         # Release trade lock in RiskManager
         self.risk_manager.release_trade_lock(outcome)
 
+        # Feed back to StrategyEngine to trigger Anti-Revenge Blacklist if lost
+        if self.strategy:
+            self.strategy.on_trade_completed(status=status, barrier=barrier)
+
         # Update balance if present
         balance_after = poc.get("balance_after")
         if balance_after is not None:
             self.risk_manager.update_balance(float(balance_after))
 
-        # Log formatted result
         result_icon = "🎉 WIN" if status == "won" else "💥 LOSS"
         logger.info(
             f"{result_icon} Contract #{contract_id} Settled! | "
-            f"Result: {status.upper()} | Profit/Loss: ${profit:+.2f} | "
+            f"Type: {contract_type} | Result: {status.upper()} | Profit/Loss: ${profit:+.2f} | "
             f"Exit Digit: [{exit_digit}] (Barrier: [{barrier}]) | "
             f"{self.risk_manager.get_summary()}"
         )
@@ -235,13 +223,13 @@ class TradeExecutor:
                 stake = trade["stake"]
 
                 if contract_type == SignalType.DIGITDIFF.value:
-                    # Differs wins if exit digit != barrier
                     won = (exit_digit != barrier)
-                    # Typical Deriv Differs return ~9.9%
                     profit = round(stake * 0.099, 2) if won else -stake
                     payout = round(stake * 1.099, 2) if won else 0.0
                 else:
+                    # DIGITMATCH wins if exit digit equals barrier
                     won = (exit_digit == barrier)
+                    # Deriv DIGITMATCH typical payout is ~9.10x (profit +8.10x)
                     profit = round(stake * 8.10, 2) if won else -stake
                     payout = round(stake * 9.10, 2) if won else 0.0
 
@@ -262,9 +250,13 @@ class TradeExecutor:
                 del self._simulated_trades[sim_id]
                 self.risk_manager.release_trade_lock(outcome)
 
+                # Anti-Revenge Blacklist feedback
+                if self.strategy:
+                    self.strategy.on_trade_completed(status=status, barrier=barrier)
+
                 result_icon = "🎉 SIM WIN" if won else "💥 SIM LOSS"
                 logger.info(
                     f"{result_icon} [SIM #{trade['contract_id']}] {status.upper()} | "
-                    f"Profit: ${profit:+.2f} | Exit Digit: [{exit_digit}] vs Barrier: [{barrier}] | "
+                    f"Type: {contract_type} | Profit: ${profit:+.2f} | Exit: [{exit_digit}] vs Barrier: [{barrier}] | "
                     f"{self.risk_manager.get_summary()}"
                 )

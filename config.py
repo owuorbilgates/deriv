@@ -45,7 +45,7 @@ class TradingConfig:
     # "R_75"   -> Volatility 75 Index
     # "R_100"  -> Volatility 100 Index
     # "1HZ100V" -> Volatility 100 (1s) Index
-    SYMBOL: str = os.getenv("DERIV_SYMBOL", "R_100")
+    SYMBOL: str = os.getenv("DERIV_SYMBOL", "1HZ100V")
 
     # -------------------------------------------------------------------------
     # Contract Parameters for Digit Match / Differs
@@ -102,8 +102,9 @@ class TradingConfig:
     LOG_LEVEL: str = os.getenv("DERIV_LOG_LEVEL", "INFO")
 
     def get_ws_url(self) -> str:
-        """Format the full WebSocket URL with the configured App ID."""
-        return self.WS_URL_TEMPLATE.format(app_id=self.APP_ID)
+        """Format the full WebSocket URL with the configured App ID (must be numeric)."""
+        app_id_clean = self.APP_ID if self.APP_ID and self.APP_ID.isdigit() else "1089"
+        return self.WS_URL_TEMPLATE.format(app_id=app_id_clean)
 
     def validate(self) -> None:
         """Validate critical configuration fields."""

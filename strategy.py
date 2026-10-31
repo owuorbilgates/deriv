@@ -93,10 +93,17 @@ class StrategyEngine:
 
     @staticmethod
     def extract_last_digit(quote: float, pip_size: int = 2) -> int:
-        """Extract exact last decimal digit via Decimal to avoid float truncation."""
+        """
+        Extract exact last decimal digit via Decimal to avoid float truncation or rounding errors.
+        Correctly handles trailing zeros and fractional/integer pip sizes (e.g. 0.01 -> 2, 3.0 -> 3).
+        """
         if pip_size is None or pip_size < 0:
             pip_size = 2
-            
+        elif 0 < pip_size < 1:
+            pip_size = abs(Decimal(str(pip_size)).as_tuple().exponent)
+        else:
+            pip_size = int(pip_size)
+
         d = Decimal(str(quote))
         formatted_price = f"{d:.{pip_size}f}"
         return int(formatted_price[-1])

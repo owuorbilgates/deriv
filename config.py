@@ -8,7 +8,8 @@ from environment variables (.env file) or defaults.
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from decimal import Decimal
+from typing import Any, Dict, Tuple
 from dotenv import load_dotenv
 
 # Automatically locate and load the .env file from the current directory or parent
@@ -45,10 +46,13 @@ class TradingConfig:
     # Multi-Market Momentum Scanner Settings (The 5-Minute Rule)
     # -------------------------------------------------------------------------
     SCANNER_SYMBOLS: Tuple[str, ...] = tuple(
-        os.getenv("DERIV_SCANNER_SYMBOLS", "R_10,R_25,R_50,R_75,R_100").split(",")
+        os.getenv(
+            "DERIV_SCANNER_SYMBOLS",
+            "1HZ10V,1HZ15V,1HZ25V,1HZ30V,1HZ50V,1HZ75V,1HZ90V,1HZ100V,R_10,R_25,R_50,R_75,R_100"
+        ).split(",")
     )
     SCANNER_INTERVAL_SECONDS: float = float(os.getenv("DERIV_SCANNER_INTERVAL", "60.0"))
-    SYMBOL: str = os.getenv("DERIV_SYMBOL", "R_100")
+    SYMBOL: str = os.getenv("DERIV_SYMBOL", "1HZ100V")
 
     # -------------------------------------------------------------------------
     # Strategy Mode & Dynamic Match/Differs State Machine
@@ -127,3 +131,48 @@ class TradingConfig:
 
 
 CONFIG = TradingConfig()
+
+
+# -------------------------------------------------------------------------
+# Pip Size & Decimal Precision Metadata for Volatility Indices
+# -------------------------------------------------------------------------
+# Deriv indices use specific decimal pip precisions:
+# - 2 decimals (pip_size=0.01 / 2): 1HZ10V, 1HZ25V, 1HZ50V, 1HZ75V, 1HZ100V, R_100
+# - 3 decimals (pip_size=0.001 / 3): 1HZ15V, 1HZ30V, 1HZ90V, R_10, R_25
+# - 4 decimals (pip_size=0.0001 / 4): R_50, R_75
+KNOWN_PIP_SIZES: Dict[str, int] = {
+    "1HZ10V": 2,
+    "1HZ15V": 3,
+    "1HZ25V": 2,
+    "1HZ30V": 3,
+    "1HZ50V": 2,
+    "1HZ75V": 2,
+    "1HZ90V": 3,
+    "1HZ100V": 2,
+    "R_10": 3,
+    "R_25": 3,
+    "R_50": 4,
+    "R_75": 4,
+    "R_100": 2,
+}
+
+
+def resolve_pip_size(raw_pip_size: Any = None, symbol: str = "") -> int:
+    """
+    Safely resolves the exact decimal precision (number of decimal places)
+    for Deriv synthetic volatility indices across all API response formats:
+    - Exponent format (e.g. 2, 2.0, 3, 4) -> 2, 3, 4
+    - Fractional step format (e.g. 0.01, 0.001, 0.0001) -> 2, 3, 4
+    - None or invalid -> looked up from KNOWN_PIP_SIZES for the symbol (fallback: 2)
+    """
+    if raw_pip_size is not None:
+        try:
+            val = float(raw_pip_size)
+            if val >= 1.0:
+                return int(val)
+            elif 0 < val < 1.0:
+                d = Decimal(str(val))
+                return abs(d.as_tuple().exponent)
+        except (ValueError, TypeError):
+            pass
+    return KNOWN_PIP_SIZES.get(symbol.upper(), 2)

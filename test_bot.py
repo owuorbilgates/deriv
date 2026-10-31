@@ -10,10 +10,10 @@ from collections import deque
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import TradingConfig
+from config import CONFIG, KNOWN_PIP_SIZES, TradingConfig, resolve_pip_size
 from risk_manager import RiskManager, TradeOutcome
 from strategy import SignalType, StrategyEngine, StrategySignal, TickData
-from scanner import MultiMarketScanner
+from scanner import MarketMomentum, MultiMarketScanner
 
 
 class TestMatchCapProtocol(unittest.TestCase):
@@ -110,10 +110,84 @@ class TestRiskManagerFlatStaking(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rm.get_current_stake(), 0.35)
 
 
-class TestDigitExtraction(unittest.TestCase):
-    def test_precision(self):
+class TestThirteenVolatilityIndicesAndPipSizes(unittest.TestCase):
+    """Verify that all 13 Deriv volatility indices are present and accurately mapped."""
+
+    EXPECTED_13_INDICES = [
+        "1HZ10V", "1HZ15V", "1HZ25V", "1HZ30V", "1HZ50V",
+        "1HZ75V", "1HZ90V", "1HZ100V", "R_10", "R_25",
+        "R_50", "R_75", "R_100"
+    ]
+
+    def test_all_13_indices_in_scanner(self):
+        scanner = MultiMarketScanner()
+        for symbol in self.EXPECTED_13_INDICES:
+            self.assertIn(symbol, scanner.symbols)
+        self.assertEqual(len(scanner.symbols), 13)
+
+    def test_pip_size_resolutions(self):
+        # 2 decimal places: 1HZ10V, 1HZ25V, 1HZ50V, 1HZ75V, 1HZ100V, R_100
+        for s in ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V", "R_100"]:
+            self.assertEqual(resolve_pip_size(None, s), 2)
+            self.assertEqual(resolve_pip_size(2.0, s), 2)
+            self.assertEqual(resolve_pip_size(0.01, s), 2)
+
+        # 3 decimal places: 1HZ15V, 1HZ30V, 1HZ90V, R_10, R_25
+        for s in ["1HZ15V", "1HZ30V", "1HZ90V", "R_10", "R_25"]:
+            self.assertEqual(resolve_pip_size(None, s), 3)
+            self.assertEqual(resolve_pip_size(3.0, s), 3)
+            self.assertEqual(resolve_pip_size(0.001, s), 3)
+
+        # 4 decimal places: R_50, R_75
+        for s in ["R_50", "R_75"]:
+            self.assertEqual(resolve_pip_size(None, s), 4)
+            self.assertEqual(resolve_pip_size(4.0, s), 4)
+            self.assertEqual(resolve_pip_size(0.0001, s), 4)
+
+
+class TestPreciseDigitExtraction(unittest.TestCase):
+    """Verify precision digit extraction with Decimal across all decimal places."""
+
+    def test_extract_last_digit_2_decimals(self):
+        # Normal quote
+        self.assertEqual(StrategyEngine.extract_last_digit(9601.54, pip_size=2), 4)
+        # Trailing zero in float representation
         self.assertEqual(StrategyEngine.extract_last_digit(1234.50, pip_size=2), 0)
-        self.assertEqual(StrategyEngine.extract_last_digit(4856.679, pip_size=3), 9)
+        self.assertEqual(StrategyEngine.extract_last_digit(1200.0, pip_size=2), 0)
+        # Fractional pip_size
+        self.assertEqual(StrategyEngine.extract_last_digit(9601.54, pip_size=0.01), 4)
+
+    def test_extract_last_digit_3_decimals(self):
+        # Normal quote
+        self.assertEqual(StrategyEngine.extract_last_digit(4864.835, pip_size=3), 5)
+        # Trailing zero in 3rd decimal place
+        self.assertEqual(StrategyEngine.extract_last_digit(4864.830, pip_size=3), 0)
+        self.assertEqual(StrategyEngine.extract_last_digit(5981.020, pip_size=0.001), 0)
+
+    def test_extract_last_digit_4_decimals(self):
+        # Normal quote
+        self.assertEqual(StrategyEngine.extract_last_digit(89.3331, pip_size=4), 1)
+        self.assertEqual(StrategyEngine.extract_last_digit(41109.4407, pip_size=4), 7)
+        # Trailing zero in 4th decimal place
+        self.assertEqual(StrategyEngine.extract_last_digit(89.3330, pip_size=4), 0)
+        self.assertEqual(StrategyEngine.extract_last_digit(89.3300, pip_size=0.0001), 0)
+
+
+class TestFiveMinuteMomentumCalculation(unittest.TestCase):
+    """Verify accuracy of 5-minute price percentage change math."""
+
+    def test_percentage_change_formula(self):
+        # Move: 100.00 -> 100.25 (0.25% up)
+        p_5m = 100.00
+        p_cur = 100.25
+        pct = abs((p_cur - p_5m) / p_5m * 100.0)
+        self.assertAlmostEqual(pct, 0.25, places=4)
+
+        # Move: 200.00 -> 199.40 (0.30% down)
+        p_5m_down = 200.00
+        p_cur_down = 199.40
+        pct_down = abs((p_cur_down - p_5m_down) / p_5m_down * 100.0)
+        self.assertAlmostEqual(pct_down, 0.30, places=4)
 
 
 if __name__ == "__main__":

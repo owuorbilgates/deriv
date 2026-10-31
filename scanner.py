@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import websockets
 
+from config import resolve_pip_size
+
 logger = logging.getLogger("MarketScanner")
 
 
@@ -33,15 +35,21 @@ class MultiMarketScanner:
     the largest price range in the last 5 minutes.
     """
 
+    DEFAULT_SYMBOLS = [
+        "1HZ10V", "1HZ15V", "1HZ25V", "1HZ30V", "1HZ50V",
+        "1HZ75V", "1HZ90V", "1HZ100V", "R_10", "R_25",
+        "R_50", "R_75", "R_100"
+    ]
+
     def __init__(self, symbols: Optional[List[str]] = None, public_ws_url: str = "wss://api.derivws.com/trading/v1/options/ws/public"):
         """
         Initialize scanner.
         
         Args:
-            symbols: List of volatility symbols to scan (default: R_10, R_25, R_50, R_75, R_100).
+            symbols: List of volatility symbols to scan (default: all 13 Deriv volatility indices).
             public_ws_url: WebSocket URL to query ticks_history.
         """
-        self.symbols = symbols or ["R_10", "R_25", "R_50", "R_75", "R_100"]
+        self.symbols = symbols or list(self.DEFAULT_SYMBOLS)
         self.public_ws_url = public_ws_url
         self.active_symbol: str = self.symbols[0]
         self.last_scan_results: Dict[str, MarketMomentum] = {}
@@ -64,7 +72,7 @@ class MultiMarketScanner:
                 try:
                     res = await client.fetch_candles(symbol, granularity=60, count=6)
                     candles = res.get("candles", [])
-                    pip_size = int(res.get("pip_size", 2))
+                    pip_size = resolve_pip_size(res.get("pip_size"), symbol)
                     if len(candles) >= 2:
                         p_5m = float(candles[0].get("open", 0.0))
                         p_cur = float(candles[-1].get("close", 0.0))
@@ -95,7 +103,7 @@ class MultiMarketScanner:
                         raw = await asyncio.wait_for(ws.recv(), timeout=6.0)
                         res = json.loads(raw)
                         candles = res.get("candles", [])
-                        pip_size = int(res.get("pip_size", 2))
+                        pip_size = resolve_pip_size(res.get("pip_size"), symbol)
                         if len(candles) >= 2:
                             p_5m = float(candles[0].get("open", 0.0))
                             p_cur = float(candles[-1].get("close", 0.0))
@@ -122,14 +130,16 @@ class MultiMarketScanner:
         top = sorted_results[0]
         self.active_symbol = top.symbol
 
-        logger.info("=" * 68)
-        logger.info("📊 5-MINUTE MULTI-MARKET MOMENTUM RANKING:")
+        logger.info("=" * 72)
+        logger.info("📊 5-MINUTE MULTI-MARKET MOMENTUM RANKING (13 VOLATILITY INDICES):")
         for idx, m in enumerate(sorted_results, 1):
-            winner_mark = " 🏆 [WINNER - ACTIVE]" if m.symbol == top.symbol else ""
+            winner_mark = " 🏆 [WINNER - ACTIVE TARGET]" if m.symbol == top.symbol else ""
             logger.info(
-                f"   {idx}. {m.symbol:<7} | 5m Move: {m.pct_change:7.4f}% "
+                f"   {idx:>2}. {m.symbol:<8} | 5m Move: {m.pct_change:7.4f}% "
                 f"(From {m.price_5m_ago:.{m.pip_size}f} -> {m.current_price:.{m.pip_size}f}){winner_mark}"
             )
-        logger.info("=" * 68)
+        logger.info("=" * 72)
+
+        return top.symbol, top.pct_change, results
 
         return top.symbol, top.pct_change, results

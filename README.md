@@ -35,8 +35,10 @@ An automated quantitative trading system designed for **Deriv Volatility Indices
 
 1. **Primary Normal Phase: Differs (`DIGITDIFF`)**
    * Starts in Differs mode.
-   * Scans candidate markets (`R_10` to `R_100`) via the 5-minute momentum rule.
-   * Trades overrepresented digits ($\ge 18\%$) with flat **$\$0.35\text{ USD}$**.
+   * Scans all 13 Volatility Indices simultaneously via the 5-minute momentum rule:
+     `abs((current_price - price_5m_ago) / price_5m_ago * 100)`.
+   * Precision digit extraction respects the asset's exact pip size (2, 3, or 4 decimals).
+   * Trades statistically overrepresented digits ($\ge 18\%$) with flat **$\$0.35\text{ USD}$**.
 
 2. **Recovery Pivot: Match (`DIGITMATCH`)**
    * **Trigger:** The moment a loss occurs in Differs mode ($-\$0.35$).
@@ -62,8 +64,8 @@ DERIV_ACCOUNT_ID=your_options_account_id
 # WebSocket Endpoint
 DERIV_WS_URL=wss://api.derivws.com/trading/v1/options/ws/public
 
-# Multi-Market Scanner Settings
-DERIV_SCANNER_SYMBOLS=R_10,R_25,R_50,R_75,R_100
+# Multi-Market Scanner Settings (All 13 Volatility Indices)
+DERIV_SCANNER_SYMBOLS=1HZ10V,1HZ15V,1HZ25V,1HZ30V,1HZ50V,1HZ75V,1HZ90V,1HZ100V,R_10,R_25,R_50,R_75,R_100
 DERIV_SCANNER_INTERVAL=60
 
 # Dynamic Strategy Settings

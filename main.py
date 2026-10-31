@@ -24,7 +24,7 @@ import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from config import CONFIG, TradingConfig
+from config import CONFIG, TradingConfig, resolve_pip_size
 from deriv_client import DerivClient
 from risk_manager import RiskManager
 from scanner import MultiMarketScanner
@@ -228,13 +228,11 @@ class DerivTradingBot:
             history = res.get("history", {})
             prices = history.get("prices", [])
             times = history.get("times", [])
-            pip_size = int(res.get("pip_size", 2))
+            pip_size = resolve_pip_size(res.get("pip_size"), symbol)
 
             ticks: List[TickData] = []
             for p, t in zip(prices, times):
-                d = Decimal(str(p))
-                formatted = f"{d:.{pip_size}f}"
-                last_digit = int(formatted[-1])
+                last_digit = StrategyEngine.extract_last_digit(p, pip_size)
                 ticks.append(TickData(
                     symbol=symbol,
                     quote=float(p),
@@ -245,7 +243,7 @@ class DerivTradingBot:
 
             self.strategy.seed_history(ticks)
             self.logger.info(
-                f"✅ Pre-seeded {len(ticks)} real ticks for [{symbol}]. "
+                f"✅ Pre-seeded {len(ticks)} real ticks for [{symbol}] (pip_size={pip_size}). "
                 f"{self.strategy.get_distribution_summary()}"
             )
         except Exception as e:
@@ -289,7 +287,8 @@ class DerivTradingBot:
             return
 
         quote = float(tick_info.get("quote", 0.0))
-        pip_size = int(tick_info.get("pip_size", 2))
+        raw_pip = tick_info.get("pip_size")
+        pip_size = resolve_pip_size(raw_pip, symbol)
         epoch = int(tick_info.get("epoch", int(time.time())))
 
         # Process real tick through strategy engine (high precision Decimal extraction)
@@ -312,15 +311,15 @@ class DerivTradingBot:
     async def _run_offline_simulation_mode(self) -> None:
         """Offline simulation loop using synthetic ticks."""
         self.logger.info("🧪 RUNNING IN OFFLINE SIMULATION MODE (Synthetic Random Walk)")
-        sim_spot = 1250.50
-        pip_size = 2
+        pip_size = resolve_pip_size(None, self.current_symbol)
+        sim_spot = 1250.50 if pip_size == 2 else (4864.835 if pip_size == 3 else 89.3331)
         epoch = int(time.time())
 
         initial_ticks = []
         for i in range(100):
-            sim_spot += round(random.uniform(-0.35, 0.35), 2)
+            sim_spot += round(random.uniform(-0.35, 0.35), pip_size)
             epoch += 1
-            last_digit = int(f"{Decimal(str(sim_spot)):.{pip_size}f}"[-1])
+            last_digit = StrategyEngine.extract_last_digit(sim_spot, pip_size)
             initial_ticks.append(TickData(
                 symbol=self.current_symbol,
                 quote=sim_spot,
@@ -331,9 +330,9 @@ class DerivTradingBot:
         self.strategy.seed_history(initial_ticks)
 
         while not self._shutdown_event.is_set() and not self.risk_manager.is_halted:
-            sim_spot += round(random.uniform(-0.40, 0.40), 2)
+            sim_spot += round(random.uniform(-0.40, 0.40), pip_size)
             epoch += 1
-            last_digit = int(f"{Decimal(str(sim_spot)):.{pip_size}f}"[-1])
+            last_digit = StrategyEngine.extract_last_digit(sim_spot, pip_size)
             tick = TickData(
                 symbol=self.current_symbol,
                 quote=sim_spot,

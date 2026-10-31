@@ -1,11 +1,53 @@
-# Python artifacts
+# =============================================================================
+# Git Ignore Configuration for Deriv Trading System (deriv package)
+# =============================================================================
+
+# Environment variables & secrets (CRITICAL: never commit credentials)
+.env
+.env.*
+*.env
+!.env.example
+
+# Logs and runtime diagnostics
+*.log
+deriv_trading_bot.log
+logs/
+
+# Python cache & build artifacts
 __pycache__/
 *.py[cod]
 *$py.class
-*.env
-!.env.example
-*.log
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
 venv/
 .venv/
-.idea/
+env/
+ENV/
+
+# IDE / Editor configuration
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating System temporary files
+.DS_Store
+Thumbs.db

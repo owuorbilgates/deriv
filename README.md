@@ -1,223 +1,107 @@
-# Deriv Digit Trading Bot (Digit Match / Digit Differs)
+# Deriv Quantitative Digit Trading Bot (Momentum-Driven Mean Reversion)
 
-An asynchronous automated algorithmic trading bot designed for high-frequency execution on **Deriv Synthetic Volatility Indices** (e.g., `R_100`, `1HZ100V`, `R_50`) using **Python 3.10+** and the **Deriv WebSocket API (v3)**.
-
----
-
-## 🏛 Architecture Overview
-
-The system is organized into modular components:
-
-```
-deriv/
-├── config.py           # Loads environment variables, risk thresholds, and constants
-├── deriv_client.py     # Asynchronous WebSocket transport, auth, ping keep-alive & auto-reconnect
-├── strategy.py         # Strategy Engine: precision decimal digit extraction & pattern recognition
-├── risk_manager.py     # Daily stop-loss, take-profit limits, trade locks & cooldown timers
-├── trade_executor.py   # Deriv contract payload construction, order dispatch & lifecycle tracking
-├── main.py             # Application orchestrator, dual console/file logging & signal handling
-├── test_bot.py         # Unit and integration test suite
-├── .env.example        # Configuration template
-└── requirements.txt    # Python dependencies
-```
-
-```mermaid
-flowchart TD
-    A["Deriv WebSocket v3<br/>(wss://ws.binaryws.com)"] <--> B["DerivClient<br/>(Auth, Reconnect, Ping)"]
-    B -->|"Live Ticks<br/>(quote, pip_size, epoch)"| C["StrategyEngine<br/>(Last Decimal Digit Extractor)"]
-    C -->|"evaluate_strategy()<br/>(DIGITMATCH | DIGITDIFF | WAIT)"| D["TradeExecutor"]
-    D <-->|"Risk Evaluation<br/>(Stop-Loss, Take-Profit, Lock, Cooldown)"| E["RiskManager"]
-    D -->|"Direct Buy Order<br/>(contract parameters)"| B
-    B -->|"proposal_open_contract<br/>(settlement updates)"| D
-    D -->|"Release Lock & Update PnL"| E
-```
+An asynchronous quantitative trading system designed for **Deriv Volatility Indices** implementing the **Momentum-Driven Mean Reversion Digit Differs (`DIGITDIFF`)** strategy with an **11.0x 2-Step Martingale Recovery Ladder**.
 
 ---
 
-## 🚀 Quick Start Guide
+## Strategy Overview & Mathematical Architecture
 
-### 1. Prerequisites
-- **Python 3.10+** (Python 3.11, 3.12, 3.13 supported)
-- Active **Deriv** account ([deriv.com](https://deriv.com))
+### 1. Multi-Market Scanner (The 5-Minute Rule)
+The bot simultaneously tracks candidate Deriv Volatility Indices:
+`R_10`, `R_25`, `R_50`, `R_75`, `R_100`.
 
-### 2. Installation
-Clone repository and install dependencies:
+Every 60 seconds, the bot queries the 5-minute historical price movement for each index via `ticks_history`:
+$$\text{Percentage Change} = \left| \frac{\text{Current Price} - \text{Price 5 Minutes Ago}}{\text{Price 5 Minutes Ago}} \right| \times 100$$
 
-```bash
-git clone https://github.com/owuorbilgates/deriv.git
-cd deriv
-pip install -r requirements.txt
-```
+The index with the highest absolute percentage change becomes the active `target_symbol`. High momentum indicates prices are leaping across ranges rapidly, decreasing stall risks.
 
-### 3. Obtain Your Deriv API Token
-1. Log into your **Deriv Account**.
-2. Navigate to **Account Settings** -> **API Token**.
-3. Create a new token with at least **Read** and **Trade** scopes enabled.
-4. Copy the token.
+### 2. Digit Distribution & Selection Engine
+- Maintains a rolling window of the last **100 ticks** for the active instrument.
+- Extracts the exact trailing decimal digit of each tick using Python's `Decimal` module respecting market `pip_size` (avoiding floating-point truncation errors).
+- Computes the occurrence frequency and percentage for all digits $0$ through $9$.
+- **Mean Reversion Rule**: If any digit appears **$> 14.0\%$** of the time (expected frequency is $10.0\%$), that digit is statistically overrepresented. The bot selects this hot digit as the prediction barrier for a **`DIGITDIFF` (Differs)** contract, betting that its frequency must mathematically cool down.
 
-### 4. Configure `.env`
-Copy `.env.example` to `.env`:
+### 3. Trade Execution
+- **Contract Type:** `DIGITDIFF` (strictly Differs contracts).
+- **Duration:** `1` tick (`1t`).
+- **Barrier:** The overrepresented digit identified by the distribution engine.
+- **Execution Lock:** Concurrency lock ensures only 1 trade is active at a time; settlement is monitored via `proposal_open_contract`.
 
-```bash
-cp .env.example .env
-```
+### 4. Risk & Stake Management
+- **Base Stake:** `$0.35 USD` per trade.
+- **Recovery Protocol:** `11.0x` Martingale multiplier upon a loss (matching Differs payouts of ~9.9%).
+- **2-Step Ladder Cap:**
+  - **Step 0:** Base stake: `$0.35 USD`.
+  - **Step 1 (After 1 loss):** Escalated stake: `$3.85 USD` ($0.35 \times 11.0$).
+  - **Win at Step 0 or Step 1:** Profit realized; resets immediately to **Step 0 ($0.35 USD)**.
+  - **Loss at Step 1 (Ladder Cap Reached):** Accepts the 2-step loss and resets immediately to **Step 0 ($0.35 USD)** to prevent account drawdown.
+- **Hard Session Stops:**
+  - `TARGET_PROFIT`: e.g. `+$5.00 USD` (terminates trading session upon reaching target).
+  - `STOP_LOSS`: e.g. `-$25.00 USD` (terminates trading session upon hitting stop limit).
+- **Balance Safeguard:** Verifies account balance before dispatching orders to prevent insufficient funds rejections.
 
-Open `.env` in an editor and set your credentials:
+---
+
+## Configuration (`.env`)
+
+Copy `.env.example` to `.env` and configure your credentials:
 
 ```ini
-# Deriv Credentials
-DERIV_API_TOKEN=your_real_api_token_here
-DERIV_APP_ID=1089
+# Deriv API Credentials (obtain from Deriv API token settings)
+DERIV_API_TOKEN=your_deriv_personal_access_token_here
+DERIV_APP_ID=your_registered_pat_app_id
+DERIV_ACCOUNT_ID=your_options_account_id
 
-# Market & Strategy Settings
-DERIV_SYMBOL=R_100
+# WebSocket Endpoint
+DERIV_WS_URL=wss://api.derivws.com/trading/v1/options/ws/public
+
+# Multi-Market Scanner Settings
+DERIV_SCANNER_SYMBOLS=R_10,R_25,R_50,R_75,R_100
+DERIV_SCANNER_INTERVAL=60
+
+# Strategy Settings
 DERIV_CONTRACT_TYPE=DIGITDIFF
-DERIV_STAKE_AMOUNT=1.00
+DERIV_DURATION=1
+DERIV_STAKE_AMOUNT=0.35
 DERIV_CURRENCY=USD
-DERIV_DURATION=5
-DERIV_DEFAULT_BARRIER=5
+DERIV_DIGIT_WINDOW_SIZE=100
+DERIV_DIGIT_THRESHOLD=14.0
 
 # Risk Management
-DERIV_DAILY_STOP_LOSS=10.00
-DERIV_DAILY_TAKE_PROFIT=20.00
+DERIV_MARTINGALE_MULTIPLIER=11.0
+DERIV_MARTINGALE_MAX_STEPS=2
+DERIV_DAILY_STOP_LOSS=25.00
+DERIV_DAILY_TAKE_PROFIT=5.00
 DERIV_COOLDOWN_SECONDS=3.0
 
-# Paper-Trading Simulation Mode (set true to test without real money)
+# Simulation Mode
 DERIV_SIMULATION_MODE=false
 ```
 
 ---
 
-## 🏃 Running the Bot
+## Quick Start & Execution
 
-### Live Trading Mode:
-```bash
+### 1. Run Live Trading
+```powershell
 python main.py
 ```
 
-### Paper-Trading Simulation Mode (Offline Synthetic Ticks):
-To test the strategy, order locks, and risk thresholds without live market risk:
-```bash
+### 2. Run Paper-Trading Simulation Mode
+```powershell
 python main.py --sim
 ```
 
-### CLI Overrides:
-You can override `.env` parameters dynamically at launch:
-```bash
-python main.py --symbol R_50 --stake 2.00 --type DIGITDIFF --duration 5 --stop-loss 15.00 --take-profit 30.00
+### 3. CLI Overrides
+```powershell
+# Custom stake, target profit, and stop loss
+python main.py --stake 0.35 --take-profit 5.00 --stop-loss 25.00
+
+# Custom scanner interval (e.g. 30 seconds)
+python main.py --scanner-interval 30
 ```
 
----
-
-## 🧠 Strategy Engine: Customizing Your Algorithm
-
-The strategy engine resides in [strategy.py].
-
-### Quantitative Digit Extraction Note
-Standard floating-point conversion like `str(1245.50)[-1]` drops trailing zeroes (`"1245.5"` -> `'5'`), producing false digits. The bot uses exact fixed-width decimal formatting based on the market's `pip_size`:
-```python
-formatted_price = f"{quote:.{pip_size}f}"
-last_digit = int(formatted_price[-1])
-```
-
-### Inserting Your Custom Rules
-In [strategy.py], find the `evaluate_strategy` method:
-
-```python
-def evaluate_strategy(self, tick_history: Deque[TickData]) -> StrategySignal:
-    # Digits list contains the most recent decimal digits [..., 7, 2, 9, 4]
-    digits: List[int] = [t.last_digit for t in tick_history]
-    
-    # === USER STRATEGY LOGIC START ===
-    # Example: Check if the last two digits are identical
-    if len(digits) >= 2 and digits[-1] == digits[-2]:
-        return StrategySignal(
-            signal_type=SignalType.DIGITDIFF,
-            predicted_barrier=digits[-1],
-            confidence=0.92,
-            reason=f"Repeated digit {digits[-1]} detected."
-        )
-    # === USER STRATEGY LOGIC END ===
-
-    return StrategySignal(signal_type=SignalType.WAIT, predicted_barrier=0, confidence=0.0, reason="No pattern")
-```
-
----
-
-## 📡 Deriv API v3 Payload Structures
-
-The bot communicates directly with the Deriv WebSocket API v3. Below are the core payloads:
-
-### 1. Authentication
-```json
-{
-  "authorize": "YOUR_API_TOKEN",
-  "req_id": 1
-}
-```
-
-### 2. Tick Stream Subscription
-```json
-{
-  "ticks": "R_100",
-  "subscribe": 1,
-  "req_id": 2
-}
-```
-
-### 3. Direct Contract Execution (Buy)
-The direct buy payload eliminates round-trip latency:
-```json
-{
-  "buy": 1,
-  "price": 1.00,
-  "parameters": {
-    "amount": 1.00,
-    "basis": "stake",
-    "contract_type": "DIGITDIFF",
-    "currency": "USD",
-    "duration": 5,
-    "duration_unit": "t",
-    "symbol": "R_100",
-    "barrier": "7"
-  },
-  "req_id": 3
-}
-```
-
-### 4. Contract Lifecycle Subscription
-```json
-{
-  "proposal_open_contract": 1,
-  "contract_id": 12345678901,
-  "subscribe": 1,
-  "req_id": 4
-}
-```
-When `is_sold == 1` or `status in ["won", "lost"]`, the settlement profit is recorded, lock released, and cooldown triggered.
-
----
-
-## 🛡️ Risk Management & Error Handling
-
-1. **Daily Stop-Loss & Take-Profit:** Halts trading as soon as net PnL crosses the defined boundaries.
-2. **Concurrency Lock:** An `asyncio.Lock` ensures zero simultaneous open positions.
-3. **Post-Trade Cooldown:** Enforces a configurable pause (e.g. 3.0s) between contract closing and next entry.
-4. **Auto-Reconnection Protocol:** Catches `ConnectionClosed` / `InvalidStatus` / network dropouts, applies exponential backoff with jitter (`2s`, `4s`, `8s`, up to `30s`), reconnects, and automatically re-authenticates and resubscribes.
-5. **Dual Logging:** Detailed logs are written to both standard output and `deriv_trading_bot.log` with millisecond timestamps.
-
----
-
-## 🧪 Running Automated Tests
-
-Run the full unit test suite:
-```bash
+### 4. Run Unit Test Suite
+```powershell
 python -m unittest deriv/test_bot.py
 ```
-Test suite coverage includes:
-- Precision decimal digit extraction (handling trailing zero edge cases)
-- Consecutive repeat anomaly detection
-- Frequency distribution triggers
-- Concurrency trade lock and release
-- Stop-loss and take-profit trip conditions
-- Deriv contract payload structure validation

@@ -4,7 +4,7 @@ Deriv Live Single Trade Execution Probe ($0.35 on Volatility 100 (1s) Index - DI
 Flow:
 1. Connect to Deriv Public Gateway to capture live ticks on 1HZ100V.
 2. Query /trading/v1/options/accounts to get active accounts and balance.
-3. Request an authenticated OTP WebSocket URL for ROT91835717.
+3. Request an authenticated OTP WebSocket URL for the target account (ROT91835717).
 4. Request price proposal for DIGITDIFF on the barrier.
 5. Execute the buy contract ($0.35 USD).
 6. Stream contract progress until settlement and report profit/loss!
@@ -20,9 +20,14 @@ import urllib.error
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment
-env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(env_path)
+# Robust multi-location .env loader
+for env_file in [
+    Path.cwd() / ".env",
+    Path(__file__).resolve().parent / ".env",
+    Path(__file__).resolve().parent.parent / ".env"
+]:
+    if env_file.exists():
+        load_dotenv(dotenv_path=env_file, override=False)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,18 +81,23 @@ async def execute_live_test_trade():
     import websockets
 
     token = os.getenv("DERIV_API_TOKEN")
-    app_id = os.getenv("DERIV_APP_ID", "34PsAhlWu7nJZr8gtqGGd")
-    symbol = "1HZ100V"
-    stake = 0.35
-    duration = 5
+    app_id = os.getenv("DERIV_APP_ID") or "34PsAhlWu7nJZr8gtqGGd"
+    target_account_id = os.getenv("DERIV_ACCOUNT_ID") or "ROT91835717"
+    symbol = os.getenv("DERIV_SYMBOL") or "1HZ100V"
+    stake = float(os.getenv("DERIV_STAKE_AMOUNT", "0.35"))
+    duration = int(os.getenv("DERIV_DURATION", "5"))
 
     logger.info("=" * 72)
     logger.info("🚀 DERIV LIVE TEST TRADE EXECUTION PROBE")
-    logger.info(f"Target Symbol:  {symbol} (Volatility 100 (1s) Index)")
+    logger.info(f"Target Symbol:  {symbol}")
     logger.info(f"Contract Type:  DIGITDIFF (Differs)")
     logger.info(f"Stake Amount:   ${stake:.2f} USD")
     logger.info(f"Deriv-App-ID:   {app_id}")
     logger.info("=" * 72)
+
+    if not token:
+        logger.error("❌ DERIV_API_TOKEN is missing! Please set your token in .env.")
+        return False
 
     # 1. Verify Accounts
     accounts, acc_err = get_trading_accounts(token, app_id)
@@ -95,16 +105,20 @@ async def execute_live_test_trade():
         logger.error(f"Failed to fetch accounts: {acc_err}")
         return False
 
-    real_acc = None
+    target_acc = None
     for acc in accounts:
         logger.info(
-            f"👤 Found Account: {acc.get('account_id')} ({acc.get('account_type').upper()}) "
+            f"👤 Found Account: {acc.get('account_id')} ({acc.get('account_type', '').upper()}) "
             f"| Balance: ${float(acc.get('balance', 0)):.2f} {acc.get('currency')} | Status: {acc.get('status')}"
         )
-        if acc.get("account_type") == "real":
-            real_acc = acc
+        if target_account_id and acc.get("account_id") == target_account_id:
+            target_acc = acc
+        elif not target_acc and acc.get("account_type") == "real":
+            target_acc = acc
 
-    target_acc = real_acc or accounts[0]
+    if not target_acc:
+        target_acc = accounts[0]
+
     account_id = target_acc.get("account_id")
     current_balance = float(target_acc.get("balance", 0.0))
     logger.info(f"🎯 Selected Target Account: {account_id} with Balance: ${current_balance:.2f} USD")
@@ -114,7 +128,7 @@ async def execute_live_test_trade():
         return False
 
     # 2. Capture live tick for barrier selection
-    live_tick_url = "wss://api.derivws.com/trading/v1/options/ws/public"
+    live_tick_url = os.getenv("DERIV_WS_URL") or "wss://api.derivws.com/trading/v1/options/ws/public"
     logger.info(f"Connecting to live public tick stream: {live_tick_url}...")
     
     last_digit = None
@@ -134,7 +148,7 @@ async def execute_live_test_trade():
                 logger.info(f"📈 [LIVE TICK #{i+1}] Spot: {formatted} | Extracted Last Digit: [{last_digit}]")
 
     # Strategy: Predict last digit will DIFFER from the current last digit
-    barrier = str(last_digit)
+    barrier = str(last_digit if last_digit is not None else 5)
     logger.info(f"🎯 Strategy Decision: Contract DIGITDIFF on Barrier '{barrier}' for {duration} ticks")
 
     # 3. Request OTP WebSocket URL
@@ -215,7 +229,6 @@ async def execute_live_test_trade():
                 is_sold = poc.get("is_sold", 0)
                 status = poc.get("status")
                 current_spot = poc.get("current_spot")
-                current_spot_time = poc.get("current_spot_time")
                 profit = poc.get("profit")
 
                 if is_sold:
@@ -233,6 +246,9 @@ async def execute_live_test_trade():
                     logger.info(f"📊 [Tick Progress] Current Spot: {current_spot} | Tick: {tick_count}/{duration}")
 
     return True
+
+
+run_single_trade_test = execute_live_test_trade
 
 
 if __name__ == "__main__":

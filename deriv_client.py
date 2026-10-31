@@ -3,8 +3,8 @@ Deriv WebSocket API Client (Dual Gateway: Modern OTP WebSocket + Legacy v3).
 
 Handles:
 - Modern OTP WebSocket trading gateway (api.derivws.com) for Personal Access Tokens (PAT).
-- Legacy v3 WebSocket failover (red.derivws.com).
-- Real-time tick stream subscriptions on Synthetic Volatility Indices.
+- Multi-market tick history and candle fetching for momentum calculations.
+- Real-time tick stream subscriptions and dynamic switching (forget / resubscribe).
 - Request-Response multiplexing via req_id.
 - Keepalive ping heartbeat and exponential backoff reconnection.
 """
@@ -16,9 +16,9 @@ import random
 import time
 import urllib.request
 import urllib.error
-from typing import Any, Callable, Coroutine, Dict, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 import websockets
-from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger("DerivClient")
 
@@ -68,7 +68,7 @@ class DerivClient:
         self._req_counter: int = 1
         self._pending_requests: Dict[int, asyncio.Future] = {}
 
-        # Subscriptions
+        # Subscriptions: {key: sub_id}
         self._active_subscriptions: Dict[str, str] = {}
         self._tick_symbol: Optional[str] = None
 
@@ -138,12 +138,14 @@ class DerivClient:
             logger.info("Detected Personal Access Token (PAT). Querying active trading accounts...")
             accounts = self._fetch_options_accounts()
             if accounts:
-                real_acc = None
+                target_acc = None
                 for a in accounts:
-                    if a.get("account_type") == "real":
-                        real_acc = a
+                    if self.target_account_id and a.get("account_id") == self.target_account_id:
+                        target_acc = a
                         break
-                selected = real_acc or accounts[0]
+                    elif not target_acc and a.get("account_type") == "real":
+                        target_acc = a
+                selected = target_acc or accounts[0]
                 self.login_id = selected.get("account_id")
                 self.balance = float(selected.get("balance", 0.0))
                 self.currency = selected.get("currency", "USD")
@@ -153,7 +155,7 @@ class DerivClient:
                 otp_url = self._request_otp_url(self.login_id)
                 if otp_url:
                     logger.info("Connecting to authenticated OTP WebSocket trading session...")
-                    self._ws = await websockets.connect(otp_url, open_timeout=10.0, ping_interval=None)
+                    self._ws = await websockets.connect(otp_url, open_timeout=12.0, ping_interval=None)
                     self.ws_url = otp_url
                     self._is_connected = True
                     self._is_authorized = True
@@ -163,7 +165,7 @@ class DerivClient:
                     logger.info("✅ Connected and authenticated to Deriv Live Trading Gateway!")
                     return True
 
-        # Fallback Candidate Gateways (Legacy or Public)
+        # Candidate Gateways (Legacy or Public)
         candidate_endpoints = [
             f"wss://red.derivws.com/websockets/v3?app_id={self.app_id}&l=EN",
             "wss://api.derivws.com/trading/v1/options/ws/public"
@@ -227,6 +229,29 @@ class DerivClient:
         logger.info(f"✅ Authorized successfully! Account: [{self.login_id}] | Balance: ${self.balance:.2f} {self.currency}")
         return auth_data
 
+    async def fetch_candles(self, symbol: str, granularity: int = 60, count: int = 6) -> Dict[str, Any]:
+        """Fetch OHLC candles for 5-minute momentum calculation."""
+        payload = {
+            "ticks_history": symbol,
+            "end": "latest",
+            "style": "candles",
+            "granularity": granularity,
+            "count": count,
+            "req_id": self._next_req_id()
+        }
+        return await self.send_request(payload)
+
+    async def fetch_ticks_history(self, symbol: str, count: int = 100) -> Dict[str, Any]:
+        """Fetch historical ticks to pre-seed the 100-tick StrategyEngine buffer."""
+        payload = {
+            "ticks_history": symbol,
+            "end": "latest",
+            "style": "ticks",
+            "count": count,
+            "req_id": self._next_req_id()
+        }
+        return await self.send_request(payload)
+
     async def subscribe_ticks(self, symbol: str) -> None:
         """Subscribe to live tick stream for a synthetic volatility index."""
         self._tick_symbol = symbol
@@ -248,6 +273,18 @@ class DerivClient:
             self._active_subscriptions[f"ticks_{symbol}"] = sub_id
             logger.info(f"✅ Subscribed to ticks for [{symbol}] (Subscription ID: {sub_id})")
 
+    async def unsubscribe_ticks(self, symbol: str) -> None:
+        """Unsubscribe from ticks for a given symbol."""
+        key = f"ticks_{symbol}"
+        sub_id = self._active_subscriptions.pop(key, None)
+        if sub_id:
+            logger.info(f"Unsubscribing from [{symbol}] (Sub ID: {sub_id})...")
+            try:
+                await self.send_request({"forget": sub_id, "req_id": self._next_req_id()})
+                logger.info(f"✅ Successfully unsubscribed from [{symbol}].")
+            except Exception as e:
+                logger.warning(f"Notice: forget request for {symbol} returned: {e}")
+
     async def buy_contract(
         self,
         symbol: str,
@@ -259,11 +296,11 @@ class DerivClient:
         currency: str = "USD"
     ) -> Dict[str, Any]:
         """
-        Request proposal and purchase contract on Deriv.
+        Request proposal and purchase contract on Deriv with real-time settlement subscription.
         """
         logger.info(
             f"🛒 Constructing BUY order: Type={contract_type} | Symbol={symbol} | "
-            f"Stake={stake:.2f} {currency} | Barrier={barrier} | Duration={duration}{duration_unit}"
+            f"Stake=${stake:.2f} {currency} | Barrier={barrier} | Duration={duration}{duration_unit}"
         )
 
         # Step A: Request Price Proposal
@@ -290,10 +327,11 @@ class DerivClient:
         ask_price = float(proposal.get("ask_price", stake))
         payout = float(proposal.get("payout", 0.0))
 
-        # Step B: Buy via Proposal ID
+        # Step B: Buy via Proposal ID with subscribe=1 to receive continuous updates
         buy_payload = {
             "buy": proposal_id,
             "price": ask_price,
+            "subscribe": 1,
             "req_id": self._next_req_id()
         }
         response = await self.send_request(buy_payload)
@@ -324,7 +362,7 @@ class DerivClient:
         response = await self.send_request(payload)
         if "error" in response:
             err = response["error"]
-            logger.warning(f"Failed to subscribe to contract #{contract_id}: {err.get('message')}")
+            logger.warning(f"Notice on subscribe open contract #{contract_id}: {err.get('message')}")
             return
 
         sub_id = response.get("subscription", {}).get("id")
@@ -375,7 +413,7 @@ class DerivClient:
                 if msg_type == "tick" and self.on_tick:
                     asyncio.create_task(self.on_tick(message["tick"]))
                 elif msg_type == "proposal_open_contract" and self.on_contract_update:
-                    asyncio.create_task(self.on_contract_update(message["proposal_open_contract"]))
+                    asyncio.create_task(self.on_contract_update(message))
 
             except ConnectionClosed as e:
                 logger.warning(f"Deriv WebSocket connection closed ({e.code}: {e.reason})")
@@ -398,6 +436,30 @@ class DerivClient:
             except Exception as e:
                 logger.debug(f"Ping transmission error: {e}")
                 break
+
+    async def reconnect_loop(self) -> bool:
+        """Automatic exponential backoff reconnection loop."""
+        logger.info("Entering automatic reconnection protocol...")
+        delay = self.reconnect_initial_delay
+
+        for attempt in range(1, self.max_reconnect_attempts + 1):
+            if not self._is_running:
+                return False
+            logger.warning(f"Reconnection attempt {attempt}/{self.max_reconnect_attempts} in {delay:.1f}s...")
+            await asyncio.sleep(delay)
+            try:
+                connected = await self.connect()
+                if connected:
+                    logger.info("✅ Reconnected successfully!")
+                    if self._tick_symbol:
+                        await self.subscribe_ticks(self._tick_symbol)
+                    return True
+            except Exception as e:
+                logger.warning(f"Reconnection attempt {attempt} failed: {e}")
+            delay = min(delay * self.reconnect_factor, self.reconnect_max_delay)
+
+        logger.critical("Maximum reconnection attempts exhausted.")
+        return False
 
     async def disconnect(self) -> None:
         """Gracefully disconnect."""

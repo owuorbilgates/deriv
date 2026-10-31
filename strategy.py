@@ -1,13 +1,15 @@
 """
 Strategy Engine Module for Deriv Digit Trading Bot.
 
-Implements the Dynamic Match/Differs State Machine with 2-Trade Match Cap:
+Implements the Decoupled Dynamic Match/Differs State Machine with 2-Trade Match Cap:
 1. Primary Normal Phase (DIFFERS):
-   - Executes DIGITDIFF on statistically overrepresented digits (>= 18.0%).
-   - Takes small frequent wins with flat $0.35 stake.
+   - Executes DIGITDIFF on statistically cold digits (<= 2.0% occurrence in rolling window).
+   - Bets against cold digits that rarely appear.
+   - Takes frequent small wins with flat $0.35 stake.
 2. Drawdown Recovery Phase (MATCH - Capped at 2 Trades):
    - If a loss occurs in Differs mode, the bot switches to MATCH mode.
    - Quarantines the losing digit in a 10-trade Anti-Revenge Blacklist.
+   - Executes DIGITMATCH on hot digits (>= 19.0% occurrence) betting with the streak.
    - Allows up to TWO (2) Match trades with a flat $0.35 stake (ZERO Martingale).
 3. State Restoration (Back to DIFFERS):
    - If ANY Match trade WINS (either trade 1 or trade 2): immediately switches back to DIFFERS.
@@ -59,25 +61,33 @@ class StrategyEngine:
     def __init__(
         self,
         buffer_size: int = 100,
-        threshold_percent: float = 18.0,
+        differs_cold_threshold: float = 2.0,
+        match_hot_threshold: float = 19.0,
         strategy_mode: str = "DIFFERS",
         blacklist_duration_trades: int = 10,
         dynamic_mode_switch: bool = True,
-        max_match_attempts: int = 2
+        max_match_attempts: int = 2,
+        threshold_percent: Optional[float] = None
     ):
         """
-        Initialize strategy engine.
+        Initialize decoupled strategy engine.
         
         Args:
             buffer_size: Rolling window size (default: 100 ticks).
-            threshold_percent: Minimum occurrence % to trigger (default: 18.0%).
+            differs_cold_threshold: Max occurrence % for cold digit in DIFFERS mode (default: 2.0%).
+            match_hot_threshold: Min occurrence % for hot digit in MATCH mode (default: 19.0%).
             strategy_mode: Starting mode ("DIFFERS" or "MATCH").
             blacklist_duration_trades: Number of trades to quarantine a losing digit.
             dynamic_mode_switch: If True, switches to MATCH on loss, and back to DIFFERS on win or 2 losses.
             max_match_attempts: Maximum number of trades permitted in MATCH mode before reverting to DIFFERS (default: 2).
+            threshold_percent: Legacy parameter (maps to match_hot_threshold if provided).
         """
         self.buffer_size = buffer_size
-        self.threshold_percent = threshold_percent
+        self.differs_cold_threshold = differs_cold_threshold
+        self.match_hot_threshold = threshold_percent if threshold_percent is not None else match_hot_threshold
+        # Legacy alias for backward compatibility
+        self.threshold_percent = self.match_hot_threshold
+        
         self.strategy_mode = strategy_mode.upper()
         self.blacklist_duration = blacklist_duration_trades
         self.dynamic_mode_switch = dynamic_mode_switch
@@ -198,7 +208,9 @@ class StrategyEngine:
 
     def evaluate_strategy(self, tick_history: Deque[TickData]) -> StrategySignal:
         """
-        Evaluate Digit Distribution over the rolling window according to active state (DIFFERS or MATCH).
+        Evaluate Digit Distribution over the rolling window according to decoupled triggers:
+        - DIFFERS Mode: Bet DIGITDIFF on cold digits (occurrence <= differs_cold_threshold, default <= 2.0%).
+        - MATCH Mode: Bet DIGITMATCH on hot digits (occurrence >= match_hot_threshold, default >= 19.0%).
         """
         mode_tag = (
             f"MATCH ({self.match_attempts + 1}/{self.max_match_attempts})"
@@ -223,90 +235,147 @@ class StrategyEngine:
         for d in range(10):
             distribution[d] = round((freq.get(d, 0) / total_ticks) * 100.0, 1)
 
-        # Ranked digits by occurrence descending
-        ranked_digits = freq.most_common()
+        # ---------------------------------------------------------------------
+        # 1. PRIMARY NORMAL PHASE: DIFFERS (Bet on COLD digits <= 2.0%)
+        # ---------------------------------------------------------------------
+        if self.strategy_mode == "DIFFERS":
+            # Rank digits from least frequent to most frequent (coldest first)
+            cold_ranked = sorted(range(10), key=lambda d: (freq.get(d, 0), d))
+            
+            target_digit = None
+            target_pct = 0.0
+            target_count = 0
 
-        # Check candidate digits against threshold and blacklist
-        target_digit = None
-        target_pct = 0.0
-        target_count = 0
+            for digit in cold_ranked:
+                count = freq.get(digit, 0)
+                pct = (count / total_ticks) * 100.0
+                if pct > self.differs_cold_threshold:
+                    break  # Remaining digits exceed cold threshold
 
-        for digit, count in ranked_digits:
-            pct = (count / total_ticks) * 100.0
-            if pct < self.threshold_percent:
+                if digit in self.digit_blacklist:
+                    rem = self.digit_blacklist[digit]
+                    logger.debug(
+                        f"[DIFFERS] Skipping cold digit [{digit}] ({pct:.1f}%): quarantined in blacklist ({rem} trades left)."
+                    )
+                    continue
+
+                target_digit = digit
+                target_pct = pct
+                target_count = count
                 break
 
-            # Check blacklist
-            if digit in self.digit_blacklist:
-                rem = self.digit_blacklist[digit]
-                logger.debug(
-                    f"[{mode_tag}] Skipping Digit [{digit}] ({pct:.1f}%): quarantined in blacklist ({rem} trades left)."
-                )
-                continue
-
-            target_digit = digit
-            target_pct = pct
-            target_count = count
-            break
-
-        # If top candidate is blacklisted and no other digit qualifies
-        if target_digit is None and ranked_digits:
-            top_d, top_cnt = ranked_digits[0]
-            top_p = (top_cnt / total_ticks) * 100.0
-            if top_p >= self.threshold_percent and top_d in self.digit_blacklist:
-                rem = self.digit_blacklist[top_d]
+            if target_digit is not None:
+                confidence = max(0.90, round(1.0 - (target_pct / 100.0), 2))
                 return StrategySignal(
-                    signal_type=SignalType.WAIT,
-                    predicted_barrier=top_d,
-                    confidence=0.0,
+                    signal_type=SignalType.DIGITDIFF,
+                    predicted_barrier=target_digit,
+                    confidence=confidence,
                     reason=(
-                        f"[{mode_tag}] Top Digit [{top_d}] ({top_p:.1f}%) is quarantined in Anti-Revenge Blacklist "
-                        f"({rem} trades left). Avoiding hot cluster."
+                        f"🎯 [DIFFERS COLD] Digit '{target_digit}' is cold ({target_count}/{total_ticks}, "
+                        f"{target_pct:.1f}% <= {self.differs_cold_threshold:.1f}%, not blacklisted). "
+                        f"Betting on DIGITDIFF."
                     ),
                     distribution=distribution
                 )
 
-        if target_digit is not None and target_pct >= self.threshold_percent:
-            confidence = min(0.99, target_pct / 100.0)
+            # Check if coldest candidate was blacklisted
+            coldest_d = cold_ranked[0]
+            coldest_cnt = freq.get(coldest_d, 0)
+            coldest_pct = (coldest_cnt / total_ticks) * 100.0
+            if coldest_pct <= self.differs_cold_threshold and coldest_d in self.digit_blacklist:
+                rem = self.digit_blacklist[coldest_d]
+                return StrategySignal(
+                    signal_type=SignalType.WAIT,
+                    predicted_barrier=coldest_d,
+                    confidence=0.0,
+                    reason=(
+                        f"[DIFFERS] Coldest Digit [{coldest_d}] ({coldest_pct:.1f}%) is quarantined in Anti-Revenge Blacklist "
+                        f"({rem} trades left). Waiting for unquarantined cold digit."
+                    ),
+                    distribution=distribution
+                )
 
-            # PHASE 2: Trend-Following Momentum Match (Capped at 2 Trades)
-            if self.strategy_mode == "MATCH":
+            return StrategySignal(
+                signal_type=SignalType.WAIT,
+                predicted_barrier=coldest_d,
+                confidence=0.0,
+                reason=(
+                    f"[DIFFERS] No cold digit detected: Coldest Digit '{coldest_d}' at "
+                    f"{coldest_pct:.1f}% > {self.differs_cold_threshold:.1f}% threshold."
+                ),
+                distribution=distribution
+            )
+
+        # ---------------------------------------------------------------------
+        # 2. DRAWDOWN RECOVERY PHASE: MATCH (Bet on HOT digits >= 19.0%)
+        # ---------------------------------------------------------------------
+        else:
+            # Rank digits from most frequent to least frequent (hottest first)
+            hot_ranked = sorted(range(10), key=lambda d: (-freq.get(d, 0), d))
+
+            target_digit = None
+            target_pct = 0.0
+            target_count = 0
+
+            for digit in hot_ranked:
+                count = freq.get(digit, 0)
+                pct = (count / total_ticks) * 100.0
+                if pct < self.match_hot_threshold:
+                    break  # Remaining digits do not meet hot threshold
+
+                if digit in self.digit_blacklist:
+                    rem = self.digit_blacklist[digit]
+                    logger.debug(
+                        f"[{mode_tag}] Skipping hot digit [{digit}] ({pct:.1f}%): quarantined in blacklist ({rem} trades left)."
+                    )
+                    continue
+
+                target_digit = digit
+                target_pct = pct
+                target_count = count
+                break
+
+            if target_digit is not None:
+                confidence = min(0.99, round(target_pct / 100.0, 2))
                 return StrategySignal(
                     signal_type=SignalType.DIGITMATCH,
                     predicted_barrier=target_digit,
                     confidence=confidence,
                     reason=(
                         f"🔥 [{mode_tag} RECOVERY] Digit '{target_digit}' is hot ({target_count}/{total_ticks}, "
-                        f"{target_pct:.1f}% >= {self.threshold_percent:.1f}%). Betting WITH streak on DIGITMATCH (Flat $0.35, No Martingale)."
+                        f"{target_pct:.1f}% >= {self.match_hot_threshold:.1f}%). "
+                        f"Betting WITH streak on DIGITMATCH (Flat $0.35, No Martingale)."
                     ),
                     distribution=distribution
                 )
 
-            # PHASE 1: Primary Mean Reversion Differs (Normal Phase)
+            # Check if hottest candidate was blacklisted
+            hottest_d = hot_ranked[0]
+            hottest_cnt = freq.get(hottest_d, 0)
+            hottest_pct = (hottest_cnt / total_ticks) * 100.0
+            if hottest_pct >= self.match_hot_threshold and hottest_d in self.digit_blacklist:
+                rem = self.digit_blacklist[hottest_d]
+                return StrategySignal(
+                    signal_type=SignalType.WAIT,
+                    predicted_barrier=hottest_d,
+                    confidence=0.0,
+                    reason=(
+                        f"[{mode_tag}] Hottest Digit [{hottest_d}] ({hottest_pct:.1f}%) is quarantined in Anti-Revenge Blacklist "
+                        f"({rem} trades left). Avoiding revenge trading."
+                    ),
+                    distribution=distribution
+                )
+
             return StrategySignal(
-                signal_type=SignalType.DIGITDIFF,
-                predicted_barrier=target_digit,
-                confidence=confidence,
+                signal_type=SignalType.WAIT,
+                predicted_barrier=hottest_d,
+                confidence=0.0,
                 reason=(
-                    f"🎯 [DIFFERS NORMAL] Digit '{target_digit}' appeared {target_count}/{total_ticks} times "
-                    f"({target_pct:.1f}% >= {self.threshold_percent:.1f}%, not blacklisted). Betting on DIGITDIFF."
+                    f"[{mode_tag}] No hot digit detected: Highest Digit '{hottest_d}' at "
+                    f"{hottest_pct:.1f}% < {self.match_hot_threshold:.1f}% threshold."
                 ),
                 distribution=distribution
             )
-
-        # No digit qualifies
-        most_common_d, count = ranked_digits[0] if ranked_digits else (0, 0)
-        pct = (count / total_ticks) * 100.0 if total_ticks > 0 else 0.0
-        return StrategySignal(
-            signal_type=SignalType.WAIT,
-            predicted_barrier=most_common_d,
-            confidence=0.0,
-            reason=(
-                f"[{mode_tag}] No anomaly detected: Highest Digit '{most_common_d}' at "
-                f"{pct:.1f}% < {self.threshold_percent:.1f}% threshold."
-            ),
-            distribution=distribution
-        )
 
     def get_distribution_summary(self) -> str:
         """Return formatted distribution summary showing active mode and blacklist."""
@@ -329,8 +398,10 @@ class StrategyEngine:
             mark = ""
             if d in self.digit_blacklist:
                 mark = f"(BL:{self.digit_blacklist[d]})"
-            elif pct >= self.threshold_percent:
-                mark = "*"
+            elif self.strategy_mode == "DIFFERS" and pct <= self.differs_cold_threshold:
+                mark = "*"  # Cold trigger candidate for Differs
+            elif self.strategy_mode == "MATCH" and pct >= self.match_hot_threshold:
+                mark = "*"  # Hot trigger candidate for Match
             items.append(f"{d}:{pct:.0f}%{mark}")
             
         bl_info = ""

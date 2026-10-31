@@ -66,8 +66,17 @@ class TradingConfig:
     # Rolling tick history window size
     DIGIT_WINDOW_SIZE: int = int(os.getenv("DERIV_DIGIT_WINDOW_SIZE", "100"))
     
-    # Statistical Anomaly Threshold: >= 18.0% (+2.67 sigma above 10% mean)
-    DIGIT_THRESHOLD_PERCENT: float = float(os.getenv("DERIV_DIGIT_THRESHOLD", "18.0"))
+    # -------------------------------------------------------------------------
+    # Decoupled Triggers for DIFFERS and MATCH
+    # -------------------------------------------------------------------------
+    # 1. DIFFERS: Cold Digit Trigger (Bet DIFFERS on cold digits appearing <= 2.0%)
+    DIFFERS_COLD_THRESHOLD_PERCENT: float = float(os.getenv("DERIV_DIFFERS_COLD_THRESHOLD", "2.0"))
+    
+    # 2. MATCH: Hot Digit Trigger (Bet MATCH on hot digits appearing >= 19.0%)
+    MATCH_HOT_THRESHOLD_PERCENT: float = float(os.getenv("DERIV_MATCH_HOT_THRESHOLD", "19.0"))
+    
+    # Legacy alias
+    DIGIT_THRESHOLD_PERCENT: float = float(os.getenv("DERIV_DIGIT_THRESHOLD", "19.0"))
     
     # Anti-Revenge Blacklist: Number of trades to quarantine a losing digit
     DIGIT_BLACKLIST_TRADES: int = int(os.getenv("DERIV_DIGIT_BLACKLIST_TRADES", "10"))
@@ -124,8 +133,10 @@ class TradingConfig:
             raise ValueError("Stop loss and take profit limits must be positive numbers.")
         if self.DIGIT_WINDOW_SIZE < 10:
             raise ValueError("DIGIT_WINDOW_SIZE must be at least 10 ticks.")
-        if self.DIGIT_THRESHOLD_PERCENT < 11.0:
-            raise ValueError("DIGIT_THRESHOLD_PERCENT must be at least 11.0%.")
+        if self.DIFFERS_COLD_THRESHOLD_PERCENT < 0.0 or self.DIFFERS_COLD_THRESHOLD_PERCENT > 10.0:
+            raise ValueError("DIFFERS_COLD_THRESHOLD_PERCENT must be between 0.0% and 10.0%.")
+        if self.MATCH_HOT_THRESHOLD_PERCENT < 10.0 or self.MATCH_HOT_THRESHOLD_PERCENT > 100.0:
+            raise ValueError("MATCH_HOT_THRESHOLD_PERCENT must be between 10.0% and 100.0%.")
         if self.MATCH_MAX_ATTEMPTS < 1:
             raise ValueError("MATCH_MAX_ATTEMPTS must be at least 1.")
 

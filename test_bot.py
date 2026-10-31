@@ -190,5 +190,142 @@ class TestFiveMinuteMomentumCalculation(unittest.TestCase):
         self.assertAlmostEqual(pct_down, 0.30, places=4)
 
 
+class TestDecoupledTriggers(unittest.TestCase):
+    """
+    Verify decoupled triggers:
+    - DIFFERS bets on cold digits (<= 2.0%)
+    - MATCH bets on hot digits (>= 19.0%)
+    """
+
+    def _create_ticks_with_distribution(self, counts_dict):
+        """Helper to create 100 TickData objects with specific digit counts."""
+        ticks = []
+        epoch = 1000
+        for digit, count in counts_dict.items():
+            for _ in range(count):
+                epoch += 1
+                ticks.append(TickData(
+                    symbol="1HZ100V",
+                    quote=float(f"1200.{digit}"),
+                    pip_size=2,
+                    last_digit=digit,
+                    epoch=epoch
+                ))
+        return ticks
+
+    def test_differs_triggers_on_cold_digit_le_2_pct(self):
+        engine = StrategyEngine(
+            buffer_size=100,
+            differs_cold_threshold=2.0,
+            match_hot_threshold=19.0,
+            strategy_mode="DIFFERS"
+        )
+        # Digit 3 appears 1 time (1%), all other 9 digits appear 11 times (11 * 9 = 99 + 1 = 100)
+        counts = {3: 1}
+        for d in range(10):
+            if d != 3:
+                counts[d] = 11
+
+        ticks = self._create_ticks_with_distribution(counts)
+        engine.seed_history(ticks)
+
+        signal = engine.evaluate_strategy(engine.tick_history)
+        self.assertEqual(signal.signal_type, SignalType.DIGITDIFF)
+        self.assertEqual(signal.predicted_barrier, 3)
+        self.assertIn("cold", signal.reason.lower())
+
+    def test_differs_waits_if_no_digit_le_2_pct(self):
+        engine = StrategyEngine(
+            buffer_size=100,
+            differs_cold_threshold=2.0,
+            match_hot_threshold=19.0,
+            strategy_mode="DIFFERS"
+        )
+        # Uniform 10% each -> No digit <= 2.0%
+        counts = {d: 10 for d in range(10)}
+        ticks = self._create_ticks_with_distribution(counts)
+        engine.seed_history(ticks)
+
+        signal = engine.evaluate_strategy(engine.tick_history)
+        self.assertEqual(signal.signal_type, SignalType.WAIT)
+
+    def test_differs_does_not_trigger_on_hot_digit(self):
+        engine = StrategyEngine(
+            buffer_size=100,
+            differs_cold_threshold=2.0,
+            match_hot_threshold=19.0,
+            strategy_mode="DIFFERS"
+        )
+        # Digit 7 appears 22 times (22%), digits 0-8 appear 8 or 9 times (all > 2.0%)
+        # Digit 7 is hot, but DIFFERS must NOT trigger on hot digits!
+        counts = {7: 22, 0: 9, 1: 9, 2: 9, 3: 9, 4: 9, 5: 9, 6: 9, 8: 8, 9: 7}
+        ticks = self._create_ticks_with_distribution(counts)
+        engine.seed_history(ticks)
+
+        signal = engine.evaluate_strategy(engine.tick_history)
+        self.assertEqual(signal.signal_type, SignalType.WAIT)
+
+    def test_match_triggers_on_hot_digit_ge_19_pct(self):
+        engine = StrategyEngine(
+            buffer_size=100,
+            differs_cold_threshold=2.0,
+            match_hot_threshold=19.0,
+            strategy_mode="MATCH"
+        )
+        # Digit 7 appears 20 times (20% >= 19%), remaining 80 ticks across others
+        counts = {0: 9, 1: 9, 2: 9, 3: 9, 4: 8, 5: 8, 6: 9, 7: 20, 8: 9, 9: 10}
+        self.assertEqual(sum(counts.values()), 100)
+
+        ticks = self._create_ticks_with_distribution(counts)
+        engine.seed_history(ticks)
+
+        signal = engine.evaluate_strategy(engine.tick_history)
+        self.assertEqual(signal.signal_type, SignalType.DIGITMATCH)
+        self.assertEqual(signal.predicted_barrier, 7)
+        self.assertIn("hot", signal.reason.lower())
+
+    def test_match_waits_if_no_digit_ge_19_pct(self):
+        engine = StrategyEngine(
+            buffer_size=100,
+            differs_cold_threshold=2.0,
+            match_hot_threshold=19.0,
+            strategy_mode="MATCH"
+        )
+        # Digit 3 appears 1 time (1%), highest digit 8 appears 15 times (15% < 19%)
+        counts = {0: 11, 1: 11, 2: 11, 3: 1, 4: 11, 5: 11, 6: 10, 7: 10, 8: 15, 9: 9}
+        self.assertEqual(sum(counts.values()), 100)
+
+        ticks = self._create_ticks_with_distribution(counts)
+        engine.seed_history(ticks)
+
+        signal = engine.evaluate_strategy(engine.tick_history)
+        # MATCH mode must NOT trigger on cold digit 3, and 15% is below 19%
+        self.assertEqual(signal.signal_type, SignalType.WAIT)
+
+    def test_cold_digit_blacklist_skips_to_next_cold_candidate(self):
+        engine = StrategyEngine(
+            buffer_size=100,
+            differs_cold_threshold=2.0,
+            match_hot_threshold=19.0,
+            strategy_mode="DIFFERS",
+            blacklist_duration_trades=10
+        )
+        # Digit 1 appears 1 time (1%), Digit 2 appears 2 times (2%)
+        # All other digits sum to 97 (total = 100)
+        counts = {0: 13, 1: 1, 2: 2, 3: 12, 4: 12, 5: 12, 6: 12, 7: 12, 8: 12, 9: 12}
+        self.assertEqual(sum(counts.values()), 100)
+
+        ticks = self._create_ticks_with_distribution(counts)
+        engine.seed_history(ticks)
+
+        # Blacklist digit 1
+        engine.digit_blacklist[1] = 5
+
+        signal = engine.evaluate_strategy(engine.tick_history)
+        # Digit 1 is blacklisted, so it skips to next cold digit: 2
+        self.assertEqual(signal.signal_type, SignalType.DIGITDIFF)
+        self.assertEqual(signal.predicted_barrier, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

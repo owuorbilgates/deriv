@@ -70,10 +70,11 @@ class DerivTradingBot:
         self.config = config
         self.logger = logging.getLogger("DerivBot")
         
-        # 1. Strategy Engine (Dynamic Match/Differs State Machine with 2-Trade Cap)
+        # 1. Strategy Engine (Decoupled Dynamic Match/Differs State Machine with 2-Trade Cap)
         self.strategy = StrategyEngine(
             buffer_size=config.DIGIT_WINDOW_SIZE,
-            threshold_percent=config.DIGIT_THRESHOLD_PERCENT,
+            differs_cold_threshold=config.DIFFERS_COLD_THRESHOLD_PERCENT,
+            match_hot_threshold=config.MATCH_HOT_THRESHOLD_PERCENT,
             strategy_mode=config.STRATEGY_MODE,
             blacklist_duration_trades=config.DIGIT_BLACKLIST_TRADES,
             dynamic_mode_switch=config.DYNAMIC_MODE_SWITCH,
@@ -140,7 +141,8 @@ class DerivTradingBot:
         self.logger.info(f"Recovery Pivot:     MATCH recovery -> on WIN or {self.config.MATCH_MAX_ATTEMPTS} LOSSES: switches back to DIFFERS")
         self.logger.info(f"Initial State:      [{self.strategy.strategy_mode}]")
         self.logger.info(f"Candidate Markets:  {list(self.config.SCANNER_SYMBOLS)}")
-        self.logger.info(f"Anomaly Threshold:  >= {self.config.DIGIT_THRESHOLD_PERCENT:.1f}% in {self.config.DIGIT_WINDOW_SIZE} ticks")
+        self.logger.info(f"Differs Trigger:    Cold Digits <= {self.config.DIFFERS_COLD_THRESHOLD_PERCENT:.1f}% in {self.config.DIGIT_WINDOW_SIZE} ticks")
+        self.logger.info(f"Match Trigger:      Hot Digits >= {self.config.MATCH_HOT_THRESHOLD_PERCENT:.1f}% in {self.config.DIGIT_WINDOW_SIZE} ticks")
         self.logger.info(f"Anti-Revenge Guard: {self.config.DIGIT_BLACKLIST_TRADES} trades quarantine on losing digits")
         self.logger.info(f"Stake Management:   Flat ${self.config.STAKE_AMOUNT:.2f} {self.config.CURRENCY} (Zero Martingale)")
         self.logger.info(f"Hard Boundaries:    Take Profit: +${self.config.DAILY_TAKE_PROFIT:.2f} | Stop Loss: -${self.config.DAILY_STOP_LOSS:.2f}")
@@ -399,7 +401,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--match-cap", type=int, default=2, help="Max Match trades before reverting to Differs (default: 2)")
     parser.add_argument("--symbol", type=str, help="Initial Volatility Index (e.g. R_100)")
     parser.add_argument("--stake", type=float, help="Base stake amount in USD (default: 0.35)")
-    parser.add_argument("--threshold", type=float, help="Statistical Anomaly % threshold (default: 18.0)")
+    parser.add_argument("--differs-threshold", type=float, help="Cold digit % threshold for DIFFERS (default: 2.0)")
+    parser.add_argument("--match-threshold", type=float, help="Hot digit % threshold for MATCH (default: 19.0)")
+    parser.add_argument("--threshold", type=float, help="Legacy alias for --match-threshold")
     parser.add_argument("--blacklist-trades", type=int, help="Quarantine duration on losing digit (default: 10)")
     parser.add_argument("--static-mode", action="store_true", help="Disable dynamic mode switching")
     parser.add_argument("--stop-loss", type=float, help="Session Stop-Loss in USD (default: 25.00)")
@@ -427,7 +431,12 @@ async def main() -> None:
         overrides["SYMBOL"] = args.symbol
     if args.stake:
         overrides["STAKE_AMOUNT"] = args.stake
-    if args.threshold:
+    if args.differs_threshold is not None:
+        overrides["DIFFERS_COLD_THRESHOLD_PERCENT"] = args.differs_threshold
+    if args.match_threshold is not None:
+        overrides["MATCH_HOT_THRESHOLD_PERCENT"] = args.match_threshold
+    elif args.threshold:
+        overrides["MATCH_HOT_THRESHOLD_PERCENT"] = args.threshold
         overrides["DIGIT_THRESHOLD_PERCENT"] = args.threshold
     if args.blacklist_trades is not None:
         overrides["DIGIT_BLACKLIST_TRADES"] = args.blacklist_trades

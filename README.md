@@ -38,12 +38,14 @@ An automated quantitative trading system designed for **Deriv Volatility Indices
    * Scans all 13 Volatility Indices simultaneously via the 5-minute momentum rule:
      `abs((current_price - price_5m_ago) / price_5m_ago * 100)`.
    * Precision digit extraction respects the asset's exact pip size (2, 3, or 4 decimals).
-   * Trades statistically overrepresented digits ($\ge 18\%$) with flat **$\$0.35\text{ USD}$**.
+   * **Cold Digit Trigger:** Bets on cold digits with occurrence $\le 2.0\%$ in the 100-tick rolling window.
+   * Stake: Flat **$\$0.35\text{ USD}$**.
 
 2. **Recovery Pivot: Match (`DIGITMATCH`)**
    * **Trigger:** The moment a loss occurs in Differs mode ($-\$0.35$).
    * **Mechanism:** Instead of applying an $11\times$ Martingale multiplier ($-\$3.85$), the bot **switches to Match mode**.
-   * **Anti-Revenge Guard:** Quarantines the losing digit in a 10-trade blacklist to prevent betting into the same cluster.
+   * **Hot Digit Trigger:** Bets WITH the streak on hot digits with occurrence $\ge 19.0\%$.
+   * **Anti-Revenge Guard:** Quarantines the losing digit in a 10-trade blacklist to prevent revenge trading.
    * **Stake:** Strictly flat **$\$0.35\text{ USD}$ (Zero Martingale)**.
 
 3. **Strict 2-Trade Cap Protocol:**
@@ -68,15 +70,16 @@ DERIV_WS_URL=wss://api.derivws.com/trading/v1/options/ws/public
 DERIV_SCANNER_SYMBOLS=1HZ10V,1HZ15V,1HZ25V,1HZ30V,1HZ50V,1HZ75V,1HZ90V,1HZ100V,R_10,R_25,R_50,R_75,R_100
 DERIV_SCANNER_INTERVAL=60
 
-# Dynamic Strategy Settings
+# Dynamic Strategy Settings (Decoupled Triggers)
 DERIV_STRATEGY_MODE=DIFFERS
+DERIV_DIFFERS_COLD_THRESHOLD=2.0
+DERIV_MATCH_HOT_THRESHOLD=19.0
 DERIV_DYNAMIC_MODE_SWITCH=true
 DERIV_MATCH_MAX_ATTEMPTS=2
 DERIV_DURATION=1
 DERIV_STAKE_AMOUNT=0.35
 DERIV_CURRENCY=USD
 DERIV_DIGIT_WINDOW_SIZE=100
-DERIV_DIGIT_THRESHOLD=18.0
 DERIV_DIGIT_BLACKLIST_TRADES=10
 
 # Risk Management

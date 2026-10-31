@@ -23,7 +23,7 @@ class TradingConfig:
     """Immutable trading bot configuration parameters."""
 
     # -------------------------------------------------------------------------
-    # Deriv API Credentials & Connection (Sanitized Defaults)
+    # Deriv API Credentials & Connection
     # -------------------------------------------------------------------------
     API_TOKEN: str = os.getenv("DERIV_API_TOKEN", "")
     APP_ID: str = os.getenv("DERIV_APP_ID", "1089")
@@ -45,17 +45,17 @@ class TradingConfig:
     SYMBOL: str = os.getenv("DERIV_SYMBOL", "R_100")
 
     # -------------------------------------------------------------------------
-    # Strategy Mode & Anomaly Parameters
+    # Strategy Mode & Dynamic Match/Differs State Machine
     # -------------------------------------------------------------------------
-    # Strategy Mode:
-    # "DIFFERS" -> Mean Reversion with Blacklist & Anomaly Filter
-    # "MATCH"   -> Trend Following on Hot Digits with Flat Stake (No Martingale)
+    # Starts in DIFFERS mode. On loss -> switches to MATCH mode (No Martingale).
+    # On MATCH win -> switches back to DIFFERS mode.
     STRATEGY_MODE: str = os.getenv("DERIV_STRATEGY_MODE", "DIFFERS").upper()
+    DYNAMIC_MODE_SWITCH: bool = os.getenv("DERIV_DYNAMIC_MODE_SWITCH", "true").lower() in ("1", "true", "yes")
     
     # Rolling tick history window size
     DIGIT_WINDOW_SIZE: int = int(os.getenv("DERIV_DIGIT_WINDOW_SIZE", "100"))
     
-    # Statistical Anomaly Threshold: Raised to 18.0% (+2.67 sigma above 10% mean)
+    # Statistical Anomaly Threshold: >= 18.0% (+2.67 sigma above 10% mean)
     DIGIT_THRESHOLD_PERCENT: float = float(os.getenv("DERIV_DIGIT_THRESHOLD", "18.0"))
     
     # Anti-Revenge Blacklist: Number of trades to quarantine a losing digit
@@ -70,17 +70,17 @@ class TradingConfig:
     DEFAULT_BARRIER: int = int(os.getenv("DERIV_DEFAULT_BARRIER", "5"))
 
     # -------------------------------------------------------------------------
-    # Risk Management & Martingale Recovery Protocol
+    # Risk Management
     # -------------------------------------------------------------------------
-    # In MATCH mode, Martingale defaults to False (flat stake $0.35 for +$3.15 payout)
-    USE_MARTINGALE: bool = os.getenv("DERIV_USE_MARTINGALE", "true").lower() in ("1", "true", "yes")
+    # In the dynamic Match/Differs strategy, Martingale is replaced by Match recovery
+    USE_MARTINGALE: bool = os.getenv("DERIV_USE_MARTINGALE", "false").lower() in ("1", "true", "yes")
     MARTINGALE_MULTIPLIER: float = float(os.getenv("DERIV_MARTINGALE_MULTIPLIER", "11.0"))
     MARTINGALE_MAX_STEPS: int = int(os.getenv("DERIV_MARTINGALE_MAX_STEPS", "2"))
 
     DAILY_STOP_LOSS: float = float(os.getenv("DERIV_DAILY_STOP_LOSS", "25.00"))
     DAILY_TAKE_PROFIT: float = float(os.getenv("DERIV_DAILY_TAKE_PROFIT", "5.00"))
     COOLDOWN_SECONDS: float = float(os.getenv("DERIV_COOLDOWN_SECONDS", "3.0"))
-    MAX_CONSECUTIVE_LOSSES: int = int(os.getenv("DERIV_MAX_CONSECUTIVE_LOSSES", "4"))
+    MAX_CONSECUTIVE_LOSSES: int = int(os.getenv("DERIV_MAX_CONSECUTIVE_LOSSES", "6"))
 
     # -------------------------------------------------------------------------
     # Network Controls & Simulation

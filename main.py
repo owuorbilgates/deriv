@@ -1,14 +1,17 @@
 """
 Main Application Orchestrator for Deriv Digit Trading Bot.
 
-Supports Dual Strategic Execution Models:
-1. Anti-Revenge Mean Reversion (DIGITDIFF):
-   - Quarantines losing digits for 10 trades to prevent revenge trading.
-   - Raised statistical threshold (>= 18.0%).
-   - 2-Step Martingale recovery ladder with strict capital protection.
-2. Trend-Following Momentum (DIGITMATCH):
-   - Exploits hot digit streaks (>= 18.0%) with flat $0.35 stake.
-   - Zero Martingale risk; captures massive ~810%-850% asymmetric payouts.
+Executes the Dynamic Match/Differs Strategy:
+1. Primary Phase (DIFFERS):
+   - Executes DIGITDIFF on statistically overrepresented digits (>= 18.0%).
+   - Takes small frequent wins with flat stake ($0.35).
+2. Drawdown Recovery Phase (MATCH):
+   - Triggered automatically upon a loss in Differs mode.
+   - Replaces the 11x Martingale multiplier with Trend-Following DIGITMATCH.
+   - Trades with a flat $0.35 stake (ZERO Martingale risk).
+   - Wins with ~810%-850% asymmetric payout (~$3.15 profit), immediately recovering drawdown.
+3. State Restoration:
+   - Upon a win in MATCH mode, the bot automatically switches back to DIFFERS mode!
 """
 
 import argparse
@@ -68,19 +71,19 @@ class DerivTradingBot:
         self.config = config
         self.logger = logging.getLogger("DerivBot")
         
-        # 1. Strategy Engine
+        # 1. Strategy Engine (Dynamic Match/Differs State Machine)
         self.strategy = StrategyEngine(
             buffer_size=config.DIGIT_WINDOW_SIZE,
             threshold_percent=config.DIGIT_THRESHOLD_PERCENT,
             strategy_mode=config.STRATEGY_MODE,
-            blacklist_duration_trades=config.DIGIT_BLACKLIST_TRADES
+            blacklist_duration_trades=config.DIGIT_BLACKLIST_TRADES,
+            dynamic_mode_switch=config.DYNAMIC_MODE_SWITCH
         )
         
-        # 2. Risk Manager (In MATCH mode, Martingale defaults to False for flat-stake asymmetrical trading)
-        use_martingale = config.USE_MARTINGALE if config.STRATEGY_MODE != "MATCH" else False
+        # 2. Risk Manager (Flat $0.35 stake, Martingale replaced by Match recovery)
         self.risk_manager = RiskManager(
             base_stake=config.STAKE_AMOUNT,
-            use_martingale=use_martingale,
+            use_martingale=config.USE_MARTINGALE,
             martingale_multiplier=config.MARTINGALE_MULTIPLIER,
             martingale_max_steps=config.MARTINGALE_MAX_STEPS,
             daily_stop_loss=config.DAILY_STOP_LOSS,
@@ -108,7 +111,7 @@ class DerivTradingBot:
         )
         self.current_symbol: str = config.SYMBOL
         
-        # 5. Trade Executor (Connected to StrategyEngine for Blacklist feedback)
+        # 5. Trade Executor (Connected to StrategyEngine for Blacklist and State Transitions)
         self.executor = TradeExecutor(
             client=self.client,
             risk_manager=self.risk_manager,
@@ -121,22 +124,19 @@ class DerivTradingBot:
 
     async def start(self) -> None:
         """Start bot execution."""
-        mode_label = (
-            "TREND-FOLLOWING MOMENTUM (DIGITMATCH - Flat Stake)"
-            if self.config.STRATEGY_MODE == "MATCH"
-            else "ANTI-REVENGE MEAN REVERSION (DIGITDIFF - Blacklist Guarded)"
-        )
-        self.logger.info("=" * 74)
-        self.logger.info("🚀 DERIV QUANTITATIVE DIGIT TRADING BOT")
-        self.logger.info(f"Execution Strategy: [{mode_label}]")
+        self.logger.info("=" * 76)
+        self.logger.info("🚀 DERIV QUANTITATIVE DIGIT TRADING BOT - DYNAMIC MATCH/DIFFERS")
+        self.logger.info(f"Primary Mode:       DIFFERS (Base Stake: ${self.config.STAKE_AMOUNT:.2f})")
+        self.logger.info(f"Recovery Pivot:     On 1 Loss -> Switches to MATCH (Flat ${self.config.STAKE_AMOUNT:.2f}, Zero Martingale)")
+        self.logger.info(f"Restoration Pivot:  On 1 Win in MATCH -> Switches back to DIFFERS")
+        self.logger.info(f"Initial State:      [{self.strategy.strategy_mode}]")
         self.logger.info(f"Candidate Markets:  {list(self.config.SCANNER_SYMBOLS)}")
-        self.logger.info(f"Anomaly Threshold:  >= {self.config.DIGIT_THRESHOLD_PERCENT:.1f}% occurrence in {self.config.DIGIT_WINDOW_SIZE} ticks")
+        self.logger.info(f"Anomaly Threshold:  >= {self.config.DIGIT_THRESHOLD_PERCENT:.1f}% in {self.config.DIGIT_WINDOW_SIZE} ticks")
         self.logger.info(f"Anti-Revenge Guard: {self.config.DIGIT_BLACKLIST_TRADES} trades quarantine on losing digits")
-        self.logger.info(f"Base Stake:         ${self.config.STAKE_AMOUNT:.2f} {self.config.CURRENCY}")
-        self.logger.info(f"Martingale Mode:    {self.risk_manager.use_martingale} (Multiplier: {self.config.MARTINGALE_MULTIPLIER}x, Max Steps: {self.config.MARTINGALE_MAX_STEPS})")
+        self.logger.info(f"Stake Management:   Flat ${self.config.STAKE_AMOUNT:.2f} {self.config.CURRENCY} (Martingale Multiplier Disabled)")
         self.logger.info(f"Hard Boundaries:    Take Profit: +${self.config.DAILY_TAKE_PROFIT:.2f} | Stop Loss: -${self.config.DAILY_STOP_LOSS:.2f}")
         self.logger.info(f"Simulation Mode:    {self.config.SIMULATION_MODE}")
-        self.logger.info("=" * 74)
+        self.logger.info("=" * 76)
 
         # Wire client callbacks
         self.client.on_tick = self._on_tick_received
@@ -349,7 +349,7 @@ class DerivTradingBot:
         
         await self.client.disconnect()
 
-        self.logger.info("=" * 74)
+        self.logger.info("=" * 76)
         self.logger.info("📊 FINAL TRADING SESSION SUMMARY")
         self.logger.info(f"Total Trades Executed: {self.risk_manager.total_trades}")
         self.logger.info(f"Winning Trades:        {self.risk_manager.winning_trades}")
@@ -361,21 +361,21 @@ class DerivTradingBot:
         self.logger.info(f"Win Rate:              {win_rate:.2f}%")
         self.logger.info(f"Net Realized PnL:      ${self.risk_manager.net_pnl:+.2f}")
         self.logger.info(f"Final Balance:         ${self.risk_manager.current_balance:.2f}")
-        self.logger.info("=" * 74)
+        self.logger.info("=" * 76)
 
 
 def parse_arguments() -> argparse.Namespace:
     """CLI Argument parser."""
     parser = argparse.ArgumentParser(
-        description="Deriv Algorithmic Quantitative Digit Trading Bot"
+        description="Deriv Dynamic Match/Differs Quantitative Trading Bot"
     )
     parser.add_argument("--sim", action="store_true", help="Run in paper-trading simulation mode")
-    parser.add_argument("--mode", choices=["DIFFERS", "MATCH"], help="Strategy Mode: DIFFERS (Mean Reversion) or MATCH (Trend Following)")
+    parser.add_argument("--mode", choices=["DIFFERS", "MATCH"], help="Initial Mode (default: DIFFERS)")
     parser.add_argument("--symbol", type=str, help="Initial Volatility Index (e.g. R_100)")
     parser.add_argument("--stake", type=float, help="Base stake amount in USD (default: 0.35)")
     parser.add_argument("--threshold", type=float, help="Statistical Anomaly % threshold (default: 18.0)")
     parser.add_argument("--blacklist-trades", type=int, help="Quarantine duration on losing digit (default: 10)")
-    parser.add_argument("--no-martingale", action="store_true", help="Disable Martingale (force flat stake)")
+    parser.add_argument("--static-mode", action="store_true", help="Disable dynamic mode switching")
     parser.add_argument("--stop-loss", type=float, help="Session Stop-Loss in USD (default: 25.00)")
     parser.add_argument("--take-profit", type=float, help="Session Take-Profit in USD (default: 5.00)")
     parser.add_argument("--scanner-interval", type=float, help="Seconds between momentum scans (default: 60)")
@@ -398,8 +398,8 @@ async def main() -> None:
         overrides["DIGIT_THRESHOLD_PERCENT"] = args.threshold
     if args.blacklist_trades is not None:
         overrides["DIGIT_BLACKLIST_TRADES"] = args.blacklist_trades
-    if args.no_martingale:
-        overrides["USE_MARTINGALE"] = False
+    if args.static_mode:
+        overrides["DYNAMIC_MODE_SWITCH"] = False
     if args.stop_loss:
         overrides["DAILY_STOP_LOSS"] = args.stop_loss
     if args.take_profit:

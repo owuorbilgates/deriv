@@ -1,14 +1,17 @@
 """
 Strategy Engine Module for Deriv Digit Trading Bot.
 
-Implements two institutional execution models:
-1. Anti-Revenge Mean Reversion (DIGITDIFF):
-   - Digit Cooldown / Blacklist: 10-trade quarantine for any losing digit.
-   - Raised Statistical Anomaly Threshold: >= 18.0% (+2.67 sigma above mean).
-   - Prevents chasing hot digit clusters.
-2. Trend-Following Momentum (DIGITMATCH):
-   - Bets WITH a parabolic digit (>= 18.0%) using flat stake ($0.35).
-   - High positive expectancy with ~810%-850% payout ($3.15 profit) and zero Martingale risk.
+Implements the Dynamic Match/Differs State Machine:
+1. Normal Phase (DIFFERS):
+   - Starts in Differs mode executing DIGITDIFF on statistically overrepresented digits (>= 18.0%).
+   - Takes small frequent wins with flat $0.35 stake.
+2. Drawdown Recovery Phase (MATCH):
+   - If a loss occurs in Differs mode, the bot immediately switches to MATCH mode.
+   - Quarantines the losing digit in a 10-trade Anti-Revenge Blacklist.
+   - Trades DIGITMATCH with a flat $0.35 stake (ZERO Martingale).
+   - High positive expectancy with ~810%-850% payout ($3.15 profit) erases the loss.
+3. Normal Phase Restoration:
+   - Upon a win in MATCH mode, the bot automatically switches back to DIFFERS mode!
 """
 
 from collections import Counter, deque
@@ -50,7 +53,7 @@ class StrategySignal:
 
 class StrategyEngine:
     """
-    Quantitative Strategy Engine supporting both Anti-Revenge Differs and Momentum Match.
+    Quantitative Strategy Engine with Dynamic Match/Differs State Machine.
     """
 
     def __init__(
@@ -58,7 +61,8 @@ class StrategyEngine:
         buffer_size: int = 100,
         threshold_percent: float = 18.0,
         strategy_mode: str = "DIFFERS",
-        blacklist_duration_trades: int = 10
+        blacklist_duration_trades: int = 10,
+        dynamic_mode_switch: bool = True
     ):
         """
         Initialize strategy engine.
@@ -66,13 +70,15 @@ class StrategyEngine:
         Args:
             buffer_size: Rolling window size (default: 100 ticks).
             threshold_percent: Minimum occurrence % to trigger (default: 18.0%).
-            strategy_mode: "DIFFERS" or "MATCH".
+            strategy_mode: Starting mode ("DIFFERS" or "MATCH").
             blacklist_duration_trades: Number of trades to quarantine a losing digit.
+            dynamic_mode_switch: If True, switches to MATCH on loss, and back to DIFFERS on win.
         """
         self.buffer_size = buffer_size
         self.threshold_percent = threshold_percent
         self.strategy_mode = strategy_mode.upper()
         self.blacklist_duration = blacklist_duration_trades
+        self.dynamic_mode_switch = dynamic_mode_switch
         
         self.tick_history: Deque[TickData] = deque(maxlen=buffer_size)
         
@@ -102,9 +108,13 @@ class StrategyEngine:
 
     def on_trade_completed(self, status: str, barrier: int) -> None:
         """
-        Update digit blacklist upon trade completion.
-        If a trade loses on `barrier`, blacklist that digit for `blacklist_duration` trades.
-        Decrements active blacklist counters for all other quarantined digits.
+        Update state machine and digit blacklist upon trade completion.
+        
+        1. Decrements active blacklist counters.
+        2. If status == 'lost': quarantines the barrier digit for blacklist_duration trades.
+        3. Dynamic State Machine Transitions:
+           - DIFFERS + Loss -> Switches to MATCH mode (Flat stake recovery, No Martingale).
+           - MATCH + Win -> Switches back to DIFFERS mode!
         """
         # Decrement existing blacklists
         expired_digits = []
@@ -124,6 +134,21 @@ class StrategyEngine:
                 f"next {self.blacklist_duration} trades to prevent revenge trading into a hot cluster."
             )
 
+        # Dynamic State Machine Transitions
+        if self.dynamic_mode_switch:
+            if self.strategy_mode == "DIFFERS" and status == "lost":
+                logger.warning(
+                    f"🔄 [STRATEGY PIVOT: DIFFERS -> MATCH] Differs contract lost! "
+                    f"Switching to Trend-Following MATCH mode (Flat stake, No Martingale) to recover loss via ~9.1x payout."
+                )
+                self.strategy_mode = "MATCH"
+            elif self.strategy_mode == "MATCH" and status == "won":
+                logger.info(
+                    f"🎉 [RECOVERY COMPLETE: MATCH -> DIFFERS] Match contract WON! "
+                    f"Loss recovered with positive payoff. Switching back to primary DIFFERS mode."
+                )
+                self.strategy_mode = "DIFFERS"
+
     def on_new_tick(self, symbol: str, quote: float, pip_size: int, epoch: int) -> Tuple[TickData, StrategySignal]:
         """Process incoming tick, update history, and evaluate strategy."""
         last_digit = self.extract_last_digit(quote, pip_size)
@@ -140,21 +165,14 @@ class StrategyEngine:
 
     def evaluate_strategy(self, tick_history: Deque[TickData]) -> StrategySignal:
         """
-        Evaluate Digit Distribution over the rolling window.
-        
-        Rules:
-        1. Window must have at least buffer_size ticks (100).
-        2. Identify candidate digits with occurrence >= threshold_percent (18.0%).
-        3. Exclude any digit currently in the Anti-Revenge Blacklist.
-        4. In "MATCH" mode: Return DIGITMATCH on the hot digit.
-           In "DIFFERS" mode: Return DIGITDIFF on the hot digit (safely cooled down).
+        Evaluate Digit Distribution over the rolling window according to active state (DIFFERS or MATCH).
         """
         if len(tick_history) < self.buffer_size:
             return StrategySignal(
                 signal_type=SignalType.WAIT,
                 predicted_barrier=0,
                 confidence=0.0,
-                reason=f"Accumulating tick history ({len(tick_history)}/{self.buffer_size} ticks required)"
+                reason=f"[{self.strategy_mode}] Accumulating tick history ({len(tick_history)}/{self.buffer_size} ticks required)"
             )
 
         digits: List[int] = [t.last_digit for t in tick_history]
@@ -169,7 +187,7 @@ class StrategyEngine:
         # Ranked digits by occurrence descending
         ranked_digits = freq.most_common()
 
-        # Check the most frequent digits against threshold and blacklist
+        # Check candidate digits against threshold and blacklist
         target_digit = None
         target_pct = 0.0
         target_count = 0
@@ -177,17 +195,16 @@ class StrategyEngine:
         for digit, count in ranked_digits:
             pct = (count / total_ticks) * 100.0
             if pct < self.threshold_percent:
-                break  # No more digits exceed threshold
+                break
 
             # Check blacklist
             if digit in self.digit_blacklist:
                 rem = self.digit_blacklist[digit]
                 logger.debug(
-                    f"Skipping Digit [{digit}] ({pct:.1f}%): currently in blacklist ({rem} trades remaining)."
+                    f"[{self.strategy_mode}] Skipping Digit [{digit}] ({pct:.1f}%): quarantined in blacklist ({rem} trades left)."
                 )
                 continue
 
-            # Found valid top non-blacklisted digit
             target_digit = digit
             target_pct = pct
             target_count = count
@@ -204,8 +221,8 @@ class StrategyEngine:
                     predicted_barrier=top_d,
                     confidence=0.0,
                     reason=(
-                        f"Top anomaly Digit [{top_d}] ({top_p:.1f}%) is quarantined in Anti-Revenge Blacklist "
-                        f"({rem} trades remaining). Avoiding hot cluster."
+                        f"[{self.strategy_mode}] Top Digit [{top_d}] ({top_p:.1f}%) is quarantined in Anti-Revenge Blacklist "
+                        f"({rem} trades left). Avoiding hot cluster."
                     ),
                     distribution=distribution
                 )
@@ -213,28 +230,27 @@ class StrategyEngine:
         if target_digit is not None and target_pct >= self.threshold_percent:
             confidence = min(0.99, target_pct / 100.0)
 
-            # MODE B: Trend-Following Momentum Match
+            # PHASE 2: Trend-Following Momentum Match (Recovery Phase)
             if self.strategy_mode == "MATCH":
                 return StrategySignal(
                     signal_type=SignalType.DIGITMATCH,
                     predicted_barrier=target_digit,
                     confidence=confidence,
                     reason=(
-                        f"🔥 Trend-Following Momentum: Digit '{target_digit}' is hot, appearing {target_count}/{total_ticks} "
-                        f"times ({target_pct:.1f}% >= {self.threshold_percent:.1f}%). Betting WITH streak on DIGITMATCH."
+                        f"🔥 [MATCH RECOVERY] Digit '{target_digit}' is hot ({target_count}/{total_ticks}, "
+                        f"{target_pct:.1f}% >= {self.threshold_percent:.1f}%). Betting WITH streak on DIGITMATCH (Flat $0.35, No Martingale)."
                     ),
                     distribution=distribution
                 )
 
-            # MODE A: Anti-Revenge Mean Reversion Differs
+            # PHASE 1: Primary Mean Reversion Differs (Normal Phase)
             return StrategySignal(
                 signal_type=SignalType.DIGITDIFF,
                 predicted_barrier=target_digit,
                 confidence=confidence,
                 reason=(
-                    f"Mean Reversion Anomaly: Digit '{target_digit}' appeared {target_count}/{total_ticks} times "
-                    f"({target_pct:.1f}% >= {self.threshold_percent:.1f}% threshold, not blacklisted). "
-                    f"Betting on Differs."
+                    f"🎯 [DIFFERS NORMAL] Digit '{target_digit}' appeared {target_count}/{total_ticks} times "
+                    f"({target_pct:.1f}% >= {self.threshold_percent:.1f}%, not blacklisted). Betting on DIGITDIFF."
                 ),
                 distribution=distribution
             )
@@ -247,16 +263,16 @@ class StrategyEngine:
             predicted_barrier=most_common_d,
             confidence=0.0,
             reason=(
-                f"No anomaly detected: Highest Digit '{most_common_d}' at "
+                f"[{self.strategy_mode}] No anomaly detected: Highest Digit '{most_common_d}' at "
                 f"{pct:.1f}% < {self.threshold_percent:.1f}% threshold."
             ),
             distribution=distribution
         )
 
     def get_distribution_summary(self) -> str:
-        """Return formatted distribution summary showing percentages and active blacklists."""
+        """Return formatted distribution summary showing active mode and blacklist."""
         if not self.tick_history:
-            return "No ticks recorded yet"
+            return f"[{self.strategy_mode}] No ticks recorded yet"
         
         digits = [t.last_digit for t in self.tick_history]
         total = len(digits)
@@ -278,4 +294,4 @@ class StrategyEngine:
             bl_str = ", ".join([f"{k} ({v} left)" for k, v in self.digit_blacklist.items()])
             bl_info = f" | Blacklist: [{bl_str}]"
             
-        return f"Digits ({total} ticks): [{' '.join(items)}]{bl_info}"
+        return f"[{self.strategy_mode}] Digits ({total} ticks): [{' '.join(items)}]{bl_info}"

@@ -1,9 +1,11 @@
 """
 Trade Execution Module for Deriv Digit Trading Bot.
 
-Constructs Deriv API trade contracts, dispatches orders, enforces locks,
-monitors live contract lifecycles via proposal_open_contract, and reports settlement
-outcomes to Risk Manager and Strategy Engine (for the Anti-Revenge Blacklist protocol).
+Supports:
+1. Live Mode: Submits real buy contracts to Deriv WebSocket and monitors settlement.
+2. Real Deriv Simulation (Paper Trading): Executes orders locally on your machine
+   against REAL live ticks streamed from Deriv. Zero real money at risk!
+3. Offline Simulation: Executes against synthetic tick streams.
 """
 
 import asyncio
@@ -31,30 +33,19 @@ class TradeExecutor:
         config: TradingConfig,
         strategy: Optional[StrategyEngine] = None
     ):
-        """
-        Initialize Trade Executor.
-        
-        Args:
-            client: Connected Deriv WebSocket client.
-            risk_manager: RiskManager instance.
-            config: TradingConfig instance.
-            strategy: StrategyEngine instance (for blacklisting losing digits).
-        """
         self.client = client
         self.risk_manager = risk_manager
         self.config = config
         self.strategy = strategy
 
-        # Pending contract tracking: {contract_id: contract_context_dict}
+        # Pending live contract tracking: {contract_id: contract_context_dict}
         self._pending_contracts: Dict[int, Dict[str, Any]] = {}
         
-        # Simulated contract tracking for paper-trading mode
+        # Simulated/Paper contract tracking
         self._simulated_trades: Dict[str, Dict[str, Any]] = {}
 
     async def execute_signal(self, signal: StrategySignal, current_tick: TickData, target_symbol: Optional[str] = None) -> bool:
-        """
-        Evaluate and execute a trading signal.
-        """
+        """Evaluate and execute a trading signal."""
         if signal.signal_type == SignalType.WAIT:
             return False
 
@@ -74,11 +65,11 @@ class TradeExecutor:
         )
         logger.info(f"   Rationale: {signal.reason}")
 
-        # 2. Simulation Mode Execution
-        if self.config.SIMULATION_MODE:
+        # 2. Local Simulation / Paper Trading Mode (Zero Real Money at Risk)
+        if self.config.SIMULATION_MODE or self.config.PAPER_TRADING_MODE:
             return await self._execute_simulated_trade(signal, current_tick, current_stake, active_symbol)
 
-        # 3. Live Trade Execution via Deriv WebSocket API
+        # 3. Live Trade Execution via Deriv WebSocket API (Real Money)
         try:
             response = await self.client.buy_contract(
                 symbol=active_symbol,
@@ -162,14 +153,11 @@ class TradeExecutor:
             duration_ticks=self.config.DURATION
         )
 
-        # Release trade lock in RiskManager
         self.risk_manager.release_trade_lock(outcome)
 
-        # Feed back to StrategyEngine to trigger Anti-Revenge Blacklist if lost
         if self.strategy:
             self.strategy.on_trade_completed(status=status, barrier=barrier)
 
-        # Update balance if present
         balance_after = poc.get("balance_after")
         if balance_after is not None:
             self.risk_manager.update_balance(float(balance_after))
@@ -183,7 +171,7 @@ class TradeExecutor:
         )
 
     # -------------------------------------------------------------------------
-    # Simulation / Paper-Trading Engine
+    # Local Simulation / Paper-Trading Engine
     # -------------------------------------------------------------------------
     async def _execute_simulated_trade(
         self,
@@ -192,11 +180,12 @@ class TradeExecutor:
         stake: float,
         symbol: str
     ) -> bool:
-        """Execute a simulated paper-trading position."""
+        """Execute a simulated paper-trading position locally on the machine."""
         sim_id = random.randint(10000000, 99999999)
+        mode_label = "REAL-DERIV SIMULATION" if self.config.PAPER_TRADING_MODE else "OFFLINE SIM"
         logger.info(
-            f"📝 [SIMULATED ORDER PLACED] ID: #{sim_id} | Symbol: {symbol} | Type: {signal.signal_type.value} | "
-            f"Barrier: {signal.predicted_barrier} | Stake: ${stake:.2f}"
+            f"📝 [{mode_label} ORDER PLACED] ID: #{sim_id} | Symbol: {symbol} | Type: {signal.signal_type.value} | "
+            f"Barrier: {signal.predicted_barrier} | Stake: ${stake:.2f} (Local Execution, Zero Risk)"
         )
 
         await self.risk_manager.acquire_trade_lock(sim_id)
@@ -213,7 +202,10 @@ class TradeExecutor:
         return True
 
     async def on_simulated_tick(self, tick: TickData) -> None:
-        """Progress simulated trades on incoming ticks."""
+        """
+        Progress and settle simulated/paper trades on incoming live Deriv market ticks.
+        Evaluates the contract against the REAL market tick's last digit.
+        """
         for sim_id, trade in list(self._simulated_trades.items()):
             trade["ticks_remaining"] -= 1
             if trade["ticks_remaining"] <= 0:
@@ -224,12 +216,13 @@ class TradeExecutor:
 
                 if contract_type == SignalType.DIGITDIFF.value:
                     won = (exit_digit != barrier)
+                    # Typical Deriv Differs payout ~9.9%
                     profit = round(stake * 0.099, 2) if won else -stake
                     payout = round(stake * 1.099, 2) if won else 0.0
                 else:
                     # DIGITMATCH wins if exit digit equals barrier
                     won = (exit_digit == barrier)
-                    # Deriv DIGITMATCH typical payout is ~9.10x (profit +8.10x)
+                    # Typical Deriv Match payout ~810% profit (9.10x total return)
                     profit = round(stake * 8.10, 2) if won else -stake
                     payout = round(stake * 9.10, 2) if won else 0.0
 
@@ -250,13 +243,13 @@ class TradeExecutor:
                 del self._simulated_trades[sim_id]
                 self.risk_manager.release_trade_lock(outcome)
 
-                # Anti-Revenge Blacklist feedback
                 if self.strategy:
                     self.strategy.on_trade_completed(status=status, barrier=barrier)
 
-                result_icon = "🎉 SIM WIN" if won else "💥 SIM LOSS"
+                mode_label = "REAL-DERIV SIM" if self.config.PAPER_TRADING_MODE else "OFFLINE SIM"
+                result_icon = f"🎉 {mode_label} WIN" if won else f"💥 {mode_label} LOSS"
                 logger.info(
-                    f"{result_icon} [SIM #{trade['contract_id']}] {status.upper()} | "
+                    f"{result_icon} [#{trade['contract_id']}] {status.upper()} | "
                     f"Type: {contract_type} | Profit: ${profit:+.2f} | Exit: [{exit_digit}] vs Barrier: [{barrier}] | "
                     f"{self.risk_manager.get_summary()}"
                 )

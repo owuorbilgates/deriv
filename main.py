@@ -1,17 +1,16 @@
 """
 Main Application Orchestrator for Deriv Digit Trading Bot.
 
-Executes the Dynamic Match/Differs Strategy:
-1. Primary Phase (DIFFERS):
-   - Executes DIGITDIFF on statistically overrepresented digits (>= 18.0%).
-   - Takes small frequent wins with flat stake ($0.35).
-2. Drawdown Recovery Phase (MATCH):
-   - Triggered automatically upon a loss in Differs mode.
-   - Replaces the 11x Martingale multiplier with Trend-Following DIGITMATCH.
-   - Trades with a flat $0.35 stake (ZERO Martingale risk).
-   - Wins with ~810%-850% asymmetric payout (~$3.15 profit), immediately recovering drawdown.
-3. State Restoration:
-   - Upon a win in MATCH mode, the bot automatically switches back to DIFFERS mode!
+Supports Three Execution Modes:
+1. Live Trading (python main.py):
+   - Real Deriv market stream (symbols, momentum, ticks).
+   - Real contracts placed on Deriv account with real funds.
+2. Real Deriv Simulation / Paper Trading (python main.py --real-sim or --paper):
+   - Connects with API token & App ID to REAL Deriv market gateway.
+   - Monitors REAL Deriv charts, live 5-minute momentum, and streams REAL live ticks.
+   - Executes contracts LOCALLY on your machine with ZERO real money at risk!
+3. Offline Simulation (python main.py --sim):
+   - Completely offline synthetic random walk for software tests without internet.
 """
 
 import argparse
@@ -80,7 +79,7 @@ class DerivTradingBot:
             dynamic_mode_switch=config.DYNAMIC_MODE_SWITCH
         )
         
-        # 2. Risk Manager (Flat $0.35 stake, Martingale replaced by Match recovery)
+        # 2. Risk Manager
         self.risk_manager = RiskManager(
             base_stake=config.STAKE_AMOUNT,
             use_martingale=config.USE_MARTINGALE,
@@ -89,7 +88,9 @@ class DerivTradingBot:
             daily_stop_loss=config.DAILY_STOP_LOSS,
             daily_take_profit=config.DAILY_TAKE_PROFIT,
             cooldown_seconds=config.COOLDOWN_SECONDS,
-            max_consecutive_losses=config.MAX_CONSECUTIVE_LOSSES
+            max_consecutive_losses=config.MAX_CONSECUTIVE_LOSSES,
+            paper_trading=config.PAPER_TRADING_MODE,
+            starting_balance=config.PAPER_STARTING_BALANCE if config.PAPER_TRADING_MODE else 0.0
         )
         
         # 3. Deriv Client
@@ -111,7 +112,7 @@ class DerivTradingBot:
         )
         self.current_symbol: str = config.SYMBOL
         
-        # 5. Trade Executor (Connected to StrategyEngine for Blacklist and State Transitions)
+        # 5. Trade Executor
         self.executor = TradeExecutor(
             client=self.client,
             risk_manager=self.risk_manager,
@@ -124,31 +125,40 @@ class DerivTradingBot:
 
     async def start(self) -> None:
         """Start bot execution."""
-        self.logger.info("=" * 76)
-        self.logger.info("🚀 DERIV QUANTITATIVE DIGIT TRADING BOT - DYNAMIC MATCH/DIFFERS")
-        self.logger.info(f"Primary Mode:       DIFFERS (Base Stake: ${self.config.STAKE_AMOUNT:.2f})")
-        self.logger.info(f"Recovery Pivot:     On 1 Loss -> Switches to MATCH (Flat ${self.config.STAKE_AMOUNT:.2f}, Zero Martingale)")
-        self.logger.info(f"Restoration Pivot:  On 1 Win in MATCH -> Switches back to DIFFERS")
+        if self.config.SIMULATION_MODE:
+            exec_mode = "OFFLINE SIMULATION (Synthetic Random Walk)"
+        elif self.config.PAPER_TRADING_MODE:
+            exec_mode = "REAL DERIV SIMULATION (Real Live Deriv Ticks, Local Paper Orders - ZERO RISK)"
+        else:
+            exec_mode = "LIVE TRADING (Real Deriv Ticks, Real Money Contracts)"
+
+        self.logger.info("=" * 80)
+        self.logger.info("🚀 DERIV QUANTITATIVE DIGIT TRADING BOT")
+        self.logger.info(f"Execution Mode:     [{exec_mode}]")
+        self.logger.info(f"Strategy Pipeline:  DIFFERS primary -> on 1 loss: MATCH recovery -> on 1 win: DIFFERS")
         self.logger.info(f"Initial State:      [{self.strategy.strategy_mode}]")
         self.logger.info(f"Candidate Markets:  {list(self.config.SCANNER_SYMBOLS)}")
         self.logger.info(f"Anomaly Threshold:  >= {self.config.DIGIT_THRESHOLD_PERCENT:.1f}% in {self.config.DIGIT_WINDOW_SIZE} ticks")
         self.logger.info(f"Anti-Revenge Guard: {self.config.DIGIT_BLACKLIST_TRADES} trades quarantine on losing digits")
-        self.logger.info(f"Stake Management:   Flat ${self.config.STAKE_AMOUNT:.2f} {self.config.CURRENCY} (Martingale Multiplier Disabled)")
+        self.logger.info(f"Stake Management:   Flat ${self.config.STAKE_AMOUNT:.2f} {self.config.CURRENCY} (No 11x Martingale)")
         self.logger.info(f"Hard Boundaries:    Take Profit: +${self.config.DAILY_TAKE_PROFIT:.2f} | Stop Loss: -${self.config.DAILY_STOP_LOSS:.2f}")
-        self.logger.info(f"Simulation Mode:    {self.config.SIMULATION_MODE}")
-        self.logger.info("=" * 76)
+        self.logger.info("=" * 80)
 
         # Wire client callbacks
         self.client.on_tick = self._on_tick_received
         self.client.on_contract_update = self.executor.handle_contract_update
 
         if self.config.SIMULATION_MODE:
-            await self._run_simulation_mode()
+            await self._run_offline_simulation_mode()
         else:
             await self._run_live_mode()
 
     async def _run_live_mode(self) -> None:
-        """Execute live trading session."""
+        """
+        Execute live gateway connection (used by both Live Mode and Real Deriv Simulation).
+        Streams genuine Deriv ticks, evaluates live momentum, and either dispatches real trades
+        or paper-trades locally.
+        """
         try:
             self.config.validate()
         except ValueError as err:
@@ -161,16 +171,23 @@ class DerivTradingBot:
                 await self.client.connect()
                 auth_info = await self.client.authorize()
                 initial_balance = float(auth_info.get("balance", 0.0))
-                self.risk_manager.update_balance(initial_balance)
+                
+                if not self.config.PAPER_TRADING_MODE:
+                    self.risk_manager.update_balance(initial_balance)
+                else:
+                    self.logger.info(
+                        f"🛡️ [REAL SIMULATION ACTIVE] Connected to Deriv as {self.client.login_id}. "
+                        f"Real Balance: ${initial_balance:.2f} (UNTOUCHED). Starting Paper Bankroll: ${self.risk_manager.current_balance:.2f}."
+                    )
 
-                # 2. Initial Multi-Market 5-Minute Momentum Scan
+                # 2. Initial Multi-Market 5-Minute Momentum Scan on real Deriv charts
                 top_symbol, top_pct, _ = await self.scanner.scan_highest_momentum(self.client)
                 self.current_symbol = top_symbol
 
-                # 3. Seed Strategy with 100 historical ticks
+                # 3. Seed Strategy with 100 REAL historical ticks
                 await self._seed_market_history(self.current_symbol)
 
-                # 4. Subscribe to live market ticks
+                # 4. Subscribe to REAL live market ticks
                 await self.client.subscribe_ticks(self.current_symbol)
 
                 # 5. Start background scanner
@@ -180,7 +197,7 @@ class DerivTradingBot:
                 # 6. Main monitoring loop
                 while not self._shutdown_event.is_set():
                     if self.risk_manager.is_halted:
-                        self.logger.warning(f"🛑 Trading halted by Risk Manager: {self.risk_manager.halt_reason}")
+                        self.logger.warning(f"🛑 Session halted by Risk Manager: {self.risk_manager.halt_reason}")
                         return
 
                     if not self.client.is_connected:
@@ -200,15 +217,15 @@ class DerivTradingBot:
             except (KeyboardInterrupt, asyncio.CancelledError):
                 break
             except Exception as e:
-                self.logger.error(f"Live engine error: {e}", exc_info=True)
+                self.logger.error(f"Engine error: {e}", exc_info=True)
                 reconnected = await self.client.reconnect_loop()
                 if not reconnected:
                     break
 
     async def _seed_market_history(self, symbol: str) -> None:
-        """Pre-fill 100-tick window immediately using historical ticks."""
+        """Pre-fill 100-tick window immediately using real Deriv historical ticks."""
         try:
-            self.logger.info(f"📥 Loading historical tick window ({self.config.DIGIT_WINDOW_SIZE} ticks) for [{symbol}]...")
+            self.logger.info(f"📥 Loading real Deriv historical ticks ({self.config.DIGIT_WINDOW_SIZE} ticks) for [{symbol}]...")
             res = await self.client.fetch_ticks_history(symbol, count=self.config.DIGIT_WINDOW_SIZE)
             history = res.get("history", {})
             prices = history.get("prices", [])
@@ -230,14 +247,14 @@ class DerivTradingBot:
 
             self.strategy.seed_history(ticks)
             self.logger.info(
-                f"✅ Pre-seeded {len(ticks)} ticks for [{symbol}]. "
+                f"✅ Pre-seeded {len(ticks)} real ticks for [{symbol}]. "
                 f"{self.strategy.get_distribution_summary()}"
             )
         except Exception as e:
             self.logger.warning(f"Failed to pre-seed tick history for {symbol}: {e}")
 
     async def _scanner_loop(self) -> None:
-        """Background loop executing every SCANNER_INTERVAL_SECONDS."""
+        """Background loop querying real 5-minute moves every SCANNER_INTERVAL_SECONDS."""
         while not self._shutdown_event.is_set() and not self.risk_manager.is_halted:
             try:
                 await asyncio.sleep(self.config.SCANNER_INTERVAL_SECONDS)
@@ -248,7 +265,7 @@ class DerivTradingBot:
 
                 if top_symbol != self.current_symbol:
                     self.logger.info(
-                        f"🔄 [DYNAMIC SWITCH] Market [{top_symbol}] took the momentum lead ({top_pct:.4f}% move)! "
+                        f"🔄 [DYNAMIC SWITCH] Market [{top_symbol}] took momentum lead ({top_pct:.4f}% move)! "
                         f"Switching active instrument from [{self.current_symbol}] to [{top_symbol}]..."
                     )
                     old_symbol = self.current_symbol
@@ -264,7 +281,7 @@ class DerivTradingBot:
                 self.logger.warning(f"Notice in scanner loop: {e}")
 
     async def _on_tick_received(self, msg: Dict[str, Any]) -> None:
-        """Handle incoming ticks."""
+        """Handle incoming real market ticks streamed from Deriv."""
         tick_info = msg.get("tick") if isinstance(msg, dict) and "tick" in msg else msg
         if not tick_info:
             return
@@ -277,25 +294,30 @@ class DerivTradingBot:
         pip_size = int(tick_info.get("pip_size", 2))
         epoch = int(tick_info.get("epoch", int(time.time())))
 
+        # Process real tick through strategy engine (high precision Decimal extraction)
         tick, signal = self.strategy.on_new_tick(symbol, quote, pip_size, epoch)
 
+        # Progress any open paper-trading contracts on incoming live tick
+        if self.config.PAPER_TRADING_MODE:
+            await self.executor.on_simulated_tick(tick)
+
         formatted_quote = f"{Decimal(str(quote)):.{pip_size}f}"
+        mode_tag = " [REAL-SIM]" if self.config.PAPER_TRADING_MODE else ""
         self.logger.info(
-            f"📈 [TICK] {symbol} | Spot: {formatted_quote} | Digit: [{tick.last_digit}] | "
+            f"📈 [TICK{mode_tag}] {symbol} | Spot: {formatted_quote} | Digit: [{tick.last_digit}] | "
             f"{self.strategy.get_distribution_summary()}"
         )
 
         if signal.signal_type in (SignalType.DIGITDIFF, SignalType.DIGITMATCH):
             await self.executor.execute_signal(signal, tick, self.current_symbol)
 
-    async def _run_simulation_mode(self) -> None:
-        """Paper-trading simulation loop."""
-        self.logger.info("🧪 RUNNING IN PAPER-TRADING SIMULATION MODE")
+    async def _run_offline_simulation_mode(self) -> None:
+        """Offline simulation loop using synthetic ticks."""
+        self.logger.info("🧪 RUNNING IN OFFLINE SIMULATION MODE (Synthetic Random Walk)")
         sim_spot = 1250.50
         pip_size = 2
         epoch = int(time.time())
 
-        # Pre-seed 100 ticks
         initial_ticks = []
         for i in range(100):
             sim_spot += round(random.uniform(-0.35, 0.35), 2)
@@ -325,7 +347,7 @@ class DerivTradingBot:
             tick, signal = self.strategy.on_new_tick(self.current_symbol, sim_spot, pip_size, epoch)
 
             self.logger.info(
-                f"📈 [SIM TICK] {self.current_symbol} | Spot: {sim_spot:.{pip_size}f} | "
+                f"📈 [OFFLINE TICK] {self.current_symbol} | Spot: {sim_spot:.{pip_size}f} | "
                 f"Digit: [{tick.last_digit}] | {self.strategy.get_distribution_summary()}"
             )
 
@@ -337,7 +359,7 @@ class DerivTradingBot:
             await asyncio.sleep(1.0)
 
         if self.risk_manager.is_halted:
-            self.logger.warning(f"🛑 Simulation halted by Risk Manager: {self.risk_manager.halt_reason}")
+            self.logger.warning(f"🛑 Offline simulation halted by Risk Manager: {self.risk_manager.halt_reason}")
 
     async def stop(self) -> None:
         """Gracefully shutdown."""
@@ -349,7 +371,7 @@ class DerivTradingBot:
         
         await self.client.disconnect()
 
-        self.logger.info("=" * 76)
+        self.logger.info("=" * 80)
         self.logger.info("📊 FINAL TRADING SESSION SUMMARY")
         self.logger.info(f"Total Trades Executed: {self.risk_manager.total_trades}")
         self.logger.info(f"Winning Trades:        {self.risk_manager.winning_trades}")
@@ -360,8 +382,9 @@ class DerivTradingBot:
         )
         self.logger.info(f"Win Rate:              {win_rate:.2f}%")
         self.logger.info(f"Net Realized PnL:      ${self.risk_manager.net_pnl:+.2f}")
-        self.logger.info(f"Final Balance:         ${self.risk_manager.current_balance:.2f}")
-        self.logger.info("=" * 76)
+        bal_label = "Final Paper Balance" if self.config.PAPER_TRADING_MODE else "Final Balance"
+        self.logger.info(f"{bal_label}:         ${self.risk_manager.current_balance:.2f}")
+        self.logger.info("=" * 80)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -369,7 +392,12 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Deriv Dynamic Match/Differs Quantitative Trading Bot"
     )
-    parser.add_argument("--sim", action="store_true", help="Run in paper-trading simulation mode")
+    # Execution modes
+    parser.add_argument("--real-sim", action="store_true", help="Run Real Deriv Simulation (live Deriv ticks & momentum, local paper orders)")
+    parser.add_argument("--paper", action="store_true", help="Alias for --real-sim")
+    parser.add_argument("--sim", action="store_true", help="Run offline synthetic simulation (no internet required)")
+    
+    # Strategy & parameters
     parser.add_argument("--mode", choices=["DIFFERS", "MATCH"], help="Initial Mode (default: DIFFERS)")
     parser.add_argument("--symbol", type=str, help="Initial Volatility Index (e.g. R_100)")
     parser.add_argument("--stake", type=float, help="Base stake amount in USD (default: 0.35)")
@@ -386,8 +414,13 @@ async def main() -> None:
     args = parse_arguments()
 
     overrides: Dict[str, Any] = {}
-    if args.sim:
+    if args.real_sim or args.paper:
+        overrides["PAPER_TRADING_MODE"] = True
+        overrides["SIMULATION_MODE"] = False
+    elif args.sim:
         overrides["SIMULATION_MODE"] = True
+        overrides["PAPER_TRADING_MODE"] = False
+
     if args.mode:
         overrides["STRATEGY_MODE"] = args.mode
     if args.symbol:

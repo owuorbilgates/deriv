@@ -3,13 +3,16 @@ Risk Management Module for Deriv Digit Trading Bot.
 
 Supports:
 1. Dynamic Staking Modes:
-   - Flat Staking (Zero Martingale): For Trend-Following DIGITMATCH (asymmetric 9x payout).
-   - 2-Step 11.0x Martingale Recovery: For DIGITDIFF ($0.35 -> $3.85 -> Reset).
-2. Hard Session Stops:
+   - Flat Staking (Zero Martingale): For Trend-Following DIGITMATCH and Dynamic State Machine.
+   - 2-Step 11.0x Martingale Recovery: Optional legacy setting.
+2. Execution Modes:
+   - Live Trading (Real Balance)
+   - Real Deriv Simulation / Paper Trading (Local Execution, Virtual Bankroll)
+   - Offline Simulation
+3. Hard Session Stops:
    - TARGET_PROFIT (e.g. $5.00) -> immediately halts
    - STOP_LOSS (e.g. $25.00) -> immediately halts
-3. Concurrency Lock: Strictly 1 open contract at a time.
-4. Account Balance Verification: Prevents orders exceeding account balance.
+4. Concurrency Lock: Strictly 1 open contract at a time.
 5. Win-Rate and Realized PnL tracking.
 """
 
@@ -45,21 +48,22 @@ class RiskManager:
     def __init__(
         self,
         base_stake: float = 0.35,
-        use_martingale: bool = True,
+        use_martingale: bool = False,
         martingale_multiplier: float = 11.0,
         martingale_max_steps: int = 2,
         daily_stop_loss: float = 25.0,
         daily_take_profit: float = 5.0,
         cooldown_seconds: float = 3.0,
-        max_consecutive_losses: int = 4,
-        starting_balance: float = 0.0
+        max_consecutive_losses: int = 6,
+        starting_balance: float = 0.0,
+        paper_trading: bool = False
     ):
         """
         Initialize Risk Manager.
         
         Args:
             base_stake: Starting stake per trade (e.g. $0.35 USD).
-            use_martingale: Whether Martingale escalation is enabled (False for DIGITMATCH flat stake).
+            use_martingale: Whether Martingale escalation is enabled.
             martingale_multiplier: Multiplier upon loss (default: 11.0x).
             martingale_max_steps: Maximum consecutive Martingale steps before resetting (default: 2).
             daily_stop_loss: Max acceptable session loss in USD (e.g. $25.00).
@@ -67,6 +71,7 @@ class RiskManager:
             cooldown_seconds: Enforced quiet period after trade settlement.
             max_consecutive_losses: Emergency stop after N successive losses.
             starting_balance: Initial account balance.
+            paper_trading: If True, tracks virtual balance locally without requiring real funds.
         """
         self.base_stake = base_stake
         self.use_martingale = use_martingale
@@ -76,9 +81,12 @@ class RiskManager:
         self.daily_take_profit = daily_take_profit
         self.cooldown_seconds = cooldown_seconds
         self.max_consecutive_losses = max_consecutive_losses
+        self.paper_trading = paper_trading
         
-        self.starting_balance = starting_balance
-        self.current_balance = starting_balance
+        # Virtual starting balance if paper trading and no real balance provided
+        default_bal = 100.0 if paper_trading else 0.0
+        self.starting_balance = starting_balance if starting_balance > 0 else default_bal
+        self.current_balance = self.starting_balance
         
         # Martingale Ladder Tracking
         self.current_martingale_step: int = 0
@@ -113,13 +121,7 @@ class RiskManager:
         return self._halt_reason
 
     def get_current_stake(self) -> float:
-        """
-        Calculate current trade stake:
-        - If use_martingale is False: Flat base_stake ($0.35)
-        - If use_martingale is True:
-          Step 0: base_stake ($0.35)
-          Step 1: round(base_stake * 11.0, 2) ($3.85)
-        """
+        """Calculate current trade stake."""
         if not self.use_martingale or self.current_martingale_step == 0:
             return round(self.base_stake, 2)
         else:
@@ -128,9 +130,15 @@ class RiskManager:
 
     def update_balance(self, new_balance: float) -> None:
         """Set or update current account balance."""
-        if self.starting_balance == 0.0:
-            self.starting_balance = new_balance
-        self.current_balance = new_balance
+        if not self.paper_trading:
+            if self.starting_balance == 0.0:
+                self.starting_balance = new_balance
+            self.current_balance = new_balance
+        else:
+            # In paper trading, keep virtual balance if account balance is 0 or low
+            if self.starting_balance == 0.0:
+                self.starting_balance = new_balance if new_balance > 0 else 100.0
+                self.current_balance = self.starting_balance
 
     def can_open_trade(self, stake: Optional[float] = None) -> Tuple[bool, str]:
         """Evaluate risk checks before opening a new position."""
@@ -185,10 +193,13 @@ class RiskManager:
         self.total_trades += 1
         self.net_pnl += outcome.profit
 
+        # In paper trading, track virtual balance locally
+        if self.paper_trading:
+            self.current_balance += outcome.profit
+
         if outcome.status == "won":
             self.winning_trades += 1
             self.consecutive_losses = 0
-            prev_step = self.current_martingale_step
             self.current_martingale_step = 0
             
             logger.info(
@@ -237,8 +248,9 @@ class RiskManager:
     def get_summary(self) -> str:
         """Return performance summary string."""
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0.0
+        bal_label = "Paper Balance" if self.paper_trading else "Balance"
         return (
             f"Trades: {self.total_trades} (W: {self.winning_trades} | L: {self.losing_trades}) | "
             f"Win Rate: {win_rate:.1f}% | Net PnL: ${self.net_pnl:+.2f} | "
-            f"Balance: ${self.current_balance:.2f} | Next Stake: ${self.get_current_stake():.2f}"
+            f"{bal_label}: ${self.current_balance:.2f} | Next Stake: ${self.get_current_stake():.2f}"
         )

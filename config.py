@@ -36,6 +36,16 @@ class TradingConfig:
     )
 
     # -------------------------------------------------------------------------
+    # Execution Modes
+    # -------------------------------------------------------------------------
+    # 1. LIVE MODE: Default (python main.py) -> Real Deriv ticks + Real Deriv orders
+    # 2. REAL DERIV SIMULATION / PAPER TRADING (python main.py --real-sim or --paper):
+    #    Connects with API token & App ID, checks REAL Deriv charts & live ticks, but orders are LOCAL on machine.
+    # 3. OFFLINE SIMULATION (python main.py --sim): Completely offline synthetic random walk.
+    PAPER_TRADING_MODE: bool = os.getenv("DERIV_PAPER_TRADING", "false").lower() in ("1", "true", "yes")
+    SIMULATION_MODE: bool = os.getenv("DERIV_SIMULATION_MODE", "false").lower() in ("1", "true", "yes")
+
+    # -------------------------------------------------------------------------
     # Multi-Market Momentum Scanner Settings (The 5-Minute Rule)
     # -------------------------------------------------------------------------
     SCANNER_SYMBOLS: Tuple[str, ...] = tuple(
@@ -47,8 +57,6 @@ class TradingConfig:
     # -------------------------------------------------------------------------
     # Strategy Mode & Dynamic Match/Differs State Machine
     # -------------------------------------------------------------------------
-    # Starts in DIFFERS mode. On loss -> switches to MATCH mode (No Martingale).
-    # On MATCH win -> switches back to DIFFERS mode.
     STRATEGY_MODE: str = os.getenv("DERIV_STRATEGY_MODE", "DIFFERS").upper()
     DYNAMIC_MODE_SWITCH: bool = os.getenv("DERIV_DYNAMIC_MODE_SWITCH", "true").lower() in ("1", "true", "yes")
     
@@ -72,7 +80,6 @@ class TradingConfig:
     # -------------------------------------------------------------------------
     # Risk Management
     # -------------------------------------------------------------------------
-    # In the dynamic Match/Differs strategy, Martingale is replaced by Match recovery
     USE_MARTINGALE: bool = os.getenv("DERIV_USE_MARTINGALE", "false").lower() in ("1", "true", "yes")
     MARTINGALE_MULTIPLIER: float = float(os.getenv("DERIV_MARTINGALE_MULTIPLIER", "11.0"))
     MARTINGALE_MAX_STEPS: int = int(os.getenv("DERIV_MARTINGALE_MAX_STEPS", "2"))
@@ -82,8 +89,11 @@ class TradingConfig:
     COOLDOWN_SECONDS: float = float(os.getenv("DERIV_COOLDOWN_SECONDS", "3.0"))
     MAX_CONSECUTIVE_LOSSES: int = int(os.getenv("DERIV_MAX_CONSECUTIVE_LOSSES", "6"))
 
+    # Virtual starting bankroll for Paper Trading Mode
+    PAPER_STARTING_BALANCE: float = float(os.getenv("DERIV_PAPER_BALANCE", "100.00"))
+
     # -------------------------------------------------------------------------
-    # Network Controls & Simulation
+    # Network Controls & Logging
     # -------------------------------------------------------------------------
     PING_INTERVAL_SECONDS: float = 30.0
     RECONNECT_INITIAL_DELAY: float = 2.0
@@ -91,7 +101,6 @@ class TradingConfig:
     RECONNECT_BACKOFF_FACTOR: float = 2.0
     MAX_RECONNECT_ATTEMPTS: int = 15
 
-    SIMULATION_MODE: bool = os.getenv("DERIV_SIMULATION_MODE", "false").lower() in ("1", "true", "yes")
     LOG_FILE: str = os.getenv("DERIV_LOG_FILE", "deriv_trading_bot.log")
     LOG_LEVEL: str = os.getenv("DERIV_LOG_LEVEL", "INFO")
 
@@ -102,7 +111,7 @@ class TradingConfig:
         if not self.SIMULATION_MODE and not self.API_TOKEN:
             raise ValueError(
                 "DERIV_API_TOKEN is missing! Please set your token in .env file "
-                "or enable DERIV_SIMULATION_MODE=true for testing."
+                "or enable offline simulation with --sim."
             )
         if self.STAKE_AMOUNT <= 0:
             raise ValueError("DERIV_STAKE_AMOUNT must be greater than 0.")

@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from config import CONFIG, TradingConfig, resolve_pip_size
 from deriv_client import DerivClient
-from risk_manager import RiskManager
+from risk_manager import RiskManager, TradeOutcome
 from scanner import MultiMarketScanner
 from strategy import SignalType, StrategyEngine, TickData
 from trade_executor import TradeExecutor
@@ -121,6 +121,7 @@ class DerivTradingBot:
             config=self.config,
             strategy=self.strategy
         )
+        self.executor.on_trade_settled = self._on_trade_settled
 
         self._shutdown_event = asyncio.Event()
         self._scanner_task: Optional[asyncio.Task] = None
@@ -137,12 +138,13 @@ class DerivTradingBot:
         self.logger.info("=" * 80)
         self.logger.info("🚀 DERIV QUANTITATIVE DIGIT TRADING BOT")
         self.logger.info(f"Execution Mode:     [{exec_mode}]")
-        self.logger.info(f"Strategy Pipeline:  DIFFERS primary -> on 1 loss: MATCH recovery (Max {self.config.MATCH_MAX_ATTEMPTS} trades cap)")
-        self.logger.info(f"Recovery Pivot:     MATCH recovery -> on WIN or {self.config.MATCH_MAX_ATTEMPTS} LOSSES: switches back to DIFFERS")
-        self.logger.info(f"Initial State:      [{self.strategy.strategy_mode}]")
+        self.logger.info(f"Selected Strategy:  [{self.strategy.strategy_mode}] (Separated Mode)")
+        if self.strategy.strategy_mode == "DIFFERS":
+            self.logger.info(f"Strategy Trigger:   Cold Digits <= {self.config.DIFFERS_COLD_THRESHOLD_PERCENT:.1f}% in {self.config.DIGIT_WINDOW_SIZE} ticks")
+        else:
+            self.logger.info(f"Strategy Trigger:   Hot Digits >= {self.config.MATCH_HOT_THRESHOLD_PERCENT:.1f}% in {self.config.DIGIT_WINDOW_SIZE} ticks")
+        self.logger.info(f"On Loss Behavior:   Scan 13 indices for new momentum leader -> Switch market -> Continue on [{self.strategy.strategy_mode}]")
         self.logger.info(f"Candidate Markets:  {list(self.config.SCANNER_SYMBOLS)}")
-        self.logger.info(f"Differs Trigger:    Cold Digits <= {self.config.DIFFERS_COLD_THRESHOLD_PERCENT:.1f}% in {self.config.DIGIT_WINDOW_SIZE} ticks")
-        self.logger.info(f"Match Trigger:      Hot Digits >= {self.config.MATCH_HOT_THRESHOLD_PERCENT:.1f}% in {self.config.DIGIT_WINDOW_SIZE} ticks")
         self.logger.info(f"Anti-Revenge Guard: {self.config.DIGIT_BLACKLIST_TRADES} trades quarantine on losing digits")
         self.logger.info(f"Stake Management:   Flat ${self.config.STAKE_AMOUNT:.2f} {self.config.CURRENCY} (Zero Martingale)")
         self.logger.info(f"Hard Boundaries:    Take Profit: +${self.config.DAILY_TAKE_PROFIT:.2f} | Stop Loss: -${self.config.DAILY_STOP_LOSS:.2f}")
@@ -278,6 +280,72 @@ class DerivTradingBot:
             except Exception as e:
                 self.logger.warning(f"Notice in scanner loop: {e}")
 
+    async def _on_trade_settled(self, outcome: TradeOutcome) -> None:
+        """Handle post-trade events. When a loss occurs, scan for a new market while staying on the chosen strategy."""
+        if outcome.status == "lost":
+            self.logger.warning(
+                f"💥 [LOSS EVENT] Trade #{outcome.contract_id} lost on [{outcome.symbol}]. "
+                f"Preserving strategy [{self.strategy.strategy_mode}] and scanning for a new market..."
+            )
+            await self._switch_market_on_loss(losing_symbol=outcome.symbol)
+
+    async def _switch_market_on_loss(self, losing_symbol: str) -> None:
+        """Scan candidate volatility indices and switch active symbol to a new momentum leader."""
+        try:
+            if self.config.SIMULATION_MODE:
+                # In offline simulation, pick a different symbol from candidate list
+                candidates = [s for s in self.config.SCANNER_SYMBOLS if s != losing_symbol]
+                new_symbol = random.choice(candidates) if candidates else losing_symbol
+                self.logger.info(
+                    f"🔄 [MARKET SWITCH ON LOSS] Offline simulation switching from [{losing_symbol}] "
+                    f"to [{new_symbol}] (Preserving [{self.strategy.strategy_mode}] strategy)..."
+                )
+                self.current_symbol = new_symbol
+                pip_size = resolve_pip_size(None, self.current_symbol)
+                sim_spot = 1250.50 if pip_size == 2 else (4864.835 if pip_size == 3 else 89.3331)
+                initial_ticks = []
+                epoch = int(time.time())
+                for _ in range(self.config.DIGIT_WINDOW_SIZE):
+                    sim_spot += round(random.uniform(-0.35, 0.35), pip_size)
+                    epoch += 1
+                    last_digit = StrategyEngine.extract_last_digit(sim_spot, pip_size)
+                    initial_ticks.append(TickData(
+                        symbol=self.current_symbol,
+                        quote=sim_spot,
+                        pip_size=pip_size,
+                        last_digit=last_digit,
+                        epoch=epoch
+                    ))
+                self.strategy.seed_history(initial_ticks)
+                return
+
+            # Live Trading & Real Deriv Simulation:
+            top_symbol, top_pct, _ = await self.scanner.scan_highest_momentum(
+                self.client,
+                exclude_symbol=losing_symbol
+            )
+
+            if top_symbol != self.current_symbol:
+                self.logger.info(
+                    f"🔄 [DYNAMIC SWITCH ON LOSS] Market [{top_symbol}] is new momentum leader ({top_pct:.4f}% move)! "
+                    f"Switching active instrument from [{self.current_symbol}] to [{top_symbol}] "
+                    f"(Preserving [{self.strategy.strategy_mode}] strategy)..."
+                )
+                old_symbol = self.current_symbol
+                self.current_symbol = top_symbol
+
+                await self.client.unsubscribe_ticks(old_symbol)
+                await self._seed_market_history(self.current_symbol)
+                await self.client.subscribe_ticks(self.current_symbol)
+            else:
+                self.logger.info(
+                    f"ℹ️ Retaining active market [{self.current_symbol}] after scan. Continuing [{self.strategy.strategy_mode}]."
+                )
+                await self._seed_market_history(self.current_symbol)
+
+        except Exception as e:
+            self.logger.error(f"Error during post-loss market switch: {e}", exc_info=True)
+
     async def _on_tick_received(self, msg: Dict[str, Any]) -> None:
         """Handle incoming real market ticks streamed from Deriv."""
         tick_info = msg.get("tick") if isinstance(msg, dict) and "tick" in msg else msg
@@ -386,6 +454,31 @@ class DerivTradingBot:
         self.logger.info("=" * 80)
 
 
+def prompt_strategy_choice(default_mode: str = "DIFFERS") -> str:
+    """Prompt user interactively to choose between [1] DIFFERS and [2] MATCH."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return default_mode
+
+    print("\n" + "=" * 68)
+    print("🎯 SELECT TRADING STRATEGY")
+    print("=" * 68)
+    print("  [1] DIFFERS  - Bet on Cold Digits (<= 2.0% frequency)")
+    print("  [2] MATCH    - Bet on Hot Digits  (>= 19.0% frequency)")
+    print("=" * 68)
+
+    try:
+        choice = input("Enter choice [1 or 2] (default: 1 - DIFFERS): ").strip()
+        if choice in ("2", "MATCH", "match", "m", "M"):
+            print(">> Selected: [2] MATCH Strategy\n")
+            return "MATCH"
+        else:
+            print(">> Selected: [1] DIFFERS Strategy\n")
+            return "DIFFERS"
+    except (EOFError, KeyboardInterrupt):
+        print("\nUsing default: DIFFERS\n")
+        return default_mode
+
+
 def parse_arguments() -> argparse.Namespace:
     """CLI Argument parser."""
     parser = argparse.ArgumentParser(
@@ -397,12 +490,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--sim", action="store_true", help="Run offline synthetic simulation (no internet required)")
     
     # Strategy & parameters
-    parser.add_argument("--mode", choices=["DIFFERS", "MATCH"], help="Initial Mode (default: DIFFERS)")
+    parser.add_argument("--mode", "-m", choices=["DIFFERS", "MATCH", "1", "2"], help="Strategy: [1] DIFFERS or [2] MATCH")
     parser.add_argument("--match-cap", type=int, default=2, help="Max Match trades before reverting to Differs (default: 2)")
     parser.add_argument("--symbol", type=str, help="Initial Volatility Index (e.g. R_100)")
     parser.add_argument("--stake", type=float, help="Base stake amount in USD (default: 0.35)")
-    parser.add_argument("--differs-threshold", type=float, help="Cold digit % threshold for DIFFERS (default: 2.0)")
-    parser.add_argument("--match-threshold", type=float, help="Hot digit % threshold for MATCH (default: 19.0)")
+    parser.add_argument("--differs-threshold", type=float, help="Cold digit %% threshold for DIFFERS (default: 2.0)")
+    parser.add_argument("--match-threshold", type=float, help="Hot digit %% threshold for MATCH (default: 19.0)")
     parser.add_argument("--threshold", type=float, help="Legacy alias for --match-threshold")
     parser.add_argument("--blacklist-trades", type=int, help="Quarantine duration on losing digit (default: 10)")
     parser.add_argument("--static-mode", action="store_true", help="Disable dynamic mode switching")
@@ -424,7 +517,10 @@ async def main() -> None:
         overrides["PAPER_TRADING_MODE"] = False
 
     if args.mode:
-        overrides["STRATEGY_MODE"] = args.mode
+        selected_mode = "DIFFERS" if args.mode in ("1", "DIFFERS") else "MATCH"
+    else:
+        selected_mode = prompt_strategy_choice(CONFIG.STRATEGY_MODE)
+    overrides["STRATEGY_MODE"] = selected_mode
     if args.match_cap:
         overrides["MATCH_MAX_ATTEMPTS"] = args.match_cap
     if args.symbol:

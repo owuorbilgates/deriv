@@ -61,11 +61,11 @@ class StrategyEngine:
     def __init__(
         self,
         buffer_size: int = 100,
-        differs_cold_threshold: float = 2.0,
+        differs_cold_threshold: float = 3.0,
         match_hot_threshold: float = 19.0,
         strategy_mode: str = "DIFFERS",
         blacklist_duration_trades: int = 10,
-        dynamic_mode_switch: bool = True,
+        dynamic_mode_switch: bool = False,
         max_match_attempts: int = 2,
         threshold_percent: Optional[float] = None
     ):

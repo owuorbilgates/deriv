@@ -1,6 +1,38 @@
-# Deriv Dynamic Match/Differs Quantitative Trading Bot
+# Deriv Quantitative Digit Trading Bot (Separated Match & Differs with Auto-Market Switch on Loss)
 
-An automated quantitative trading system designed for **Deriv Volatility Indices** executing a **Dynamic Match/Differs Strategy with a 2-Trade Match Cap** that eliminates Martingale blowouts and caps recovery drawdown.
+An automated quantitative trading system designed for **Deriv Volatility Indices** executing standalone **DIFFERS** or **MATCH** strategies. At startup, the user chooses which strategy to execute. When a trade incurs a loss, the bot **automatically scans all 13 Volatility Indices for the highest momentum leader**, switches active instruments, and **continues on the same strategy**.
+
+---
+
+## Strategy Selection at Startup
+
+When starting the bot without `--mode`, you are interactively prompted:
+```text
+====================================================================
+🎯 SELECT TRADING STRATEGY
+====================================================================
+  [1] DIFFERS  - Bet on Cold Digits (<= 2.0% frequency)
+  [2] MATCH    - Bet on Hot Digits  (>= 19.0% frequency)
+====================================================================
+Enter choice [1 or 2] (default: 1 - DIFFERS): 
+```
+Or pass the mode directly in CLI: `python main.py --mode 1` (or `--mode DIFFERS`) / `python main.py --mode 2` (or `--mode MATCH`).
+
+---
+
+## Strategy Logic & Dynamic Loss Handling
+
+1. **Option 1: DIFFERS Strategy (`DIGITDIFF`)**
+   - **Trigger:** Bets against **cold digits** with occurrence $\le 2.0\%$ in the rolling 100-tick window.
+   - **Stake:** Flat **$\$0.35\text{ USD}$** (No Martingale).
+   - **On Win:** Continues trading DIFFERS on the active market.
+   - **On Loss:** Quarantines the losing digit in the anti-revenge blacklist, **immediately re-scans all 13 Volatility Indices**, switches to the new top-momentum market, and **continues trading DIFFERS**.
+
+2. **Option 2: MATCH Strategy (`DIGITMATCH`)**
+   - **Trigger:** Bets WITH the streak on **hot digits** with occurrence $\ge 19.0\%$ in the rolling 100-tick window.
+   - **Stake:** Flat **$\$0.35\text{ USD}$** (Captures $+810\%$ profit per win).
+   - **On Win:** Continues trading MATCH on the active market.
+   - **On Loss:** Quarantines the losing digit in the anti-revenge blacklist, **immediately re-scans all 13 Volatility Indices**, switches to the new top-momentum market, and **continues trading MATCH**.
 
 ---
 
@@ -11,47 +43,6 @@ An automated quantitative trading system designed for **Deriv Volatility Indices
 | **1. Real Deriv Simulation** | `python main.py --real-sim`<br>*(or `python main.py --paper`)* | **YES (Live WebSocket)** | **NO ($0.00 Risk)** | Connects via API token/App ID, checks **genuine 5-minute momentum and real live ticks** from Deriv charts, but executes orders **locally on your machine**. |
 | **2. Offline Simulation** | `python main.py --sim` | **NO (Offline)** | **NO ($0.00 Risk)** | Runs a purely offline synthetic random-walk generator. Useful for testing logic without an internet connection. |
 | **3. Live Trading** | `python main.py` | **YES (Live WebSocket)** | **YES (Real Funds)** | Places real buy orders on your Deriv options trading account (`ROT...`). |
-
----
-
-## Strategy Architecture: Dynamic Match/Differs State Machine (2-Trade Match Cap)
-
-```
-                        ┌────────────────────────────────────────────────────────┐
-                        │                                                        │
-                        ▼                                                        │
-         ┌──────────────────────────────┐                          ┌─────────────┴────────────────┐
-         │      DIFFERS MODE            │      On 1 Loss           │        MATCH MODE            │
-         │  - Primary normal trading    ├─────────────────────────►│  - Recovery trading         │
-         │  - Contract: DIGITDIFF       │   (NO 11x Martingale!)   │  - Contract: DIGITMATCH      │
-         │  - Flat Stake: $0.35 USD     │                          │  - Flat Stake: $0.35 USD     │
-         │  - Frequent small wins       │                          │  - STRICT 2-TRADE CAP!       │
-         └──────────────┬───────────────┘                          └─────────────┬────────────────┘
-                        ▲                                                        │
-                        │       1. On 1 WIN in Match (Recovery Won!)             │
-                        └───────OR───────────────────────────────────────────────┘
-                                2. On 2 LOSSES in Match (Cap Reached, Exit Drawdown)
-```
-
-1. **Primary Normal Phase: Differs (`DIGITDIFF`)**
-   * Starts in Differs mode.
-   * Scans all 13 Volatility Indices simultaneously via the 5-minute momentum rule:
-     `abs((current_price - price_5m_ago) / price_5m_ago * 100)`.
-   * Precision digit extraction respects the asset's exact pip size (2, 3, or 4 decimals).
-   * **Cold Digit Trigger:** Bets on cold digits with occurrence $\le 2.0\%$ in the 100-tick rolling window.
-   * Stake: Flat **$\$0.35\text{ USD}$**.
-
-2. **Recovery Pivot: Match (`DIGITMATCH`)**
-   * **Trigger:** The moment a loss occurs in Differs mode ($-\$0.35$).
-   * **Mechanism:** Instead of applying an $11\times$ Martingale multiplier ($-\$3.85$), the bot **switches to Match mode**.
-   * **Hot Digit Trigger:** Bets WITH the streak on hot digits with occurrence $\ge 19.0\%$.
-   * **Anti-Revenge Guard:** Quarantines the losing digit in a 10-trade blacklist to prevent revenge trading.
-   * **Stake:** Strictly flat **$\$0.35\text{ USD}$ (Zero Martingale)**.
-
-3. **Strict 2-Trade Cap Protocol:**
-   * **Win on Trade 1 or Trade 2:** Match payout ($\sim 9.1\times$ return, $+\$2.80\text{ to }+\$3.15\text{ profit}$) recovers the Differs loss; **immediately switches back to Differs mode**!
-   * **Loss on Trade 1:** Bot attempts a second Match trade (`2/2`).
-   * **Loss on Trade 2 (Cap Reached):** Bot terminates Match recovery immediately, caps drawdown to at most 2 Match trades ($-\$0.70$), and **switches back to Differs mode**!
 
 ---
 

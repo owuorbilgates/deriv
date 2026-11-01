@@ -55,12 +55,13 @@ class TradingConfig:
     SYMBOL: str = os.getenv("DERIV_SYMBOL", "1HZ100V")
 
     # -------------------------------------------------------------------------
-    # Strategy Mode & Dynamic Match/Differs State Machine
+    # Strategy Mode: User selects DIFFERS (1) or MATCH (2) at startup
     # -------------------------------------------------------------------------
     STRATEGY_MODE: str = os.getenv("DERIV_STRATEGY_MODE", "DIFFERS").upper()
-    DYNAMIC_MODE_SWITCH: bool = os.getenv("DERIV_DYNAMIC_MODE_SWITCH", "true").lower() in ("1", "true", "yes")
+    DYNAMIC_MODE_SWITCH: bool = os.getenv("DERIV_DYNAMIC_MODE_SWITCH", "false").lower() in ("1", "true", "yes")
+    SCAN_ON_LOSS: bool = os.getenv("DERIV_SCAN_ON_LOSS", "true").lower() in ("1", "true", "yes")
     
-    # In Match recovery mode, strictly cap at 2 trades then switch back to Differs
+    # In Match recovery mode (if dynamic switch enabled), strictly cap at 2 trades
     MATCH_MAX_ATTEMPTS: int = int(os.getenv("DERIV_MATCH_MAX_ATTEMPTS", "2"))
     
     # Rolling tick history window size

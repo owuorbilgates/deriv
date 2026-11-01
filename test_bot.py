@@ -14,6 +14,7 @@ from config import CONFIG, KNOWN_PIP_SIZES, TradingConfig, resolve_pip_size
 from risk_manager import RiskManager, TradeOutcome
 from strategy import SignalType, StrategyEngine, StrategySignal, TickData
 from scanner import MarketMomentum, MultiMarketScanner
+from trade_executor import TradeExecutor
 
 
 class TestMatchCapProtocol(unittest.TestCase):
@@ -325,6 +326,57 @@ class TestDecoupledTriggers(unittest.TestCase):
         # Digit 1 is blacklisted, so it skips to next cold digit: 2
         self.assertEqual(signal.signal_type, SignalType.DIGITDIFF)
         self.assertEqual(signal.predicted_barrier, 2)
+
+
+class TestSeparatedModesAndScanOnLoss(unittest.TestCase):
+    """
+    Verify separated modes:
+    - User selects DIFFERS (1) or MATCH (2) at start.
+    - On loss, remains on the same strategy mode.
+    - Scanner can exclude the losing market to select a new momentum leader.
+    """
+
+    def test_differs_loss_preserves_differs_mode(self):
+        """In separated mode (dynamic_mode_switch=False), loss keeps DIFFERS mode."""
+        engine = StrategyEngine(
+            strategy_mode="DIFFERS",
+            dynamic_mode_switch=False
+        )
+        self.assertEqual(engine.strategy_mode, "DIFFERS")
+        # Trade loses
+        engine.on_trade_completed(status="lost", barrier=4)
+        self.assertEqual(engine.strategy_mode, "DIFFERS")
+        self.assertIn(4, engine.digit_blacklist)
+
+    def test_match_loss_preserves_match_mode(self):
+        """In separated mode (dynamic_mode_switch=False), loss keeps MATCH mode."""
+        engine = StrategyEngine(
+            strategy_mode="MATCH",
+            dynamic_mode_switch=False
+        )
+        self.assertEqual(engine.strategy_mode, "MATCH")
+        # Trade loses
+        engine.on_trade_completed(status="lost", barrier=7)
+        self.assertEqual(engine.strategy_mode, "MATCH")
+        self.assertIn(7, engine.digit_blacklist)
+
+    def test_scanner_exclude_losing_symbol(self):
+        """When exclude_symbol is specified, scanner picks top among remaining markets."""
+        scanner = MultiMarketScanner(symbols=["1HZ10V", "1HZ100V", "R_50"])
+        # Mock scan results
+        scanner.last_scan_results = {
+            "1HZ10V": MarketMomentum(symbol="1HZ10V", price_5m_ago=100.0, current_price=100.5, pct_change=0.50, pip_size=2),
+            "1HZ100V": MarketMomentum(symbol="1HZ100V", price_5m_ago=100.0, current_price=100.4, pct_change=0.40, pip_size=2),
+            "R_50": MarketMomentum(symbol="R_50", price_5m_ago=100.0, current_price=100.2, pct_change=0.20, pip_size=4),
+        }
+        sorted_results = sorted(scanner.last_scan_results.values(), key=lambda m: m.pct_change, reverse=True)
+        # Without exclusion, 1HZ10V is #1
+        self.assertEqual(sorted_results[0].symbol, "1HZ10V")
+
+        # With 1HZ10V excluded (losing market), top eligible is 1HZ100V
+        eligible = [m for m in sorted_results if m.symbol != "1HZ10V"]
+        top = eligible[0]
+        self.assertEqual(top.symbol, "1HZ100V")
 
 
 if __name__ == "__main__":

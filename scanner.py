@@ -54,16 +54,23 @@ class MultiMarketScanner:
         self.active_symbol: str = self.symbols[0]
         self.last_scan_results: Dict[str, MarketMomentum] = {}
 
-    async def scan_highest_momentum(self, client=None) -> Tuple[str, float, Dict[str, MarketMomentum]]:
+    async def scan_highest_momentum(
+        self, 
+        client=None, 
+        exclude_symbol: Optional[str] = None
+    ) -> Tuple[str, float, Dict[str, MarketMomentum]]:
         """
         Scan all candidate symbols and return the one with the highest 5-minute price change.
         
-        Can query either via the existing connected DerivClient or via a dedicated public WS probe.
-        
+        Args:
+            client: Connected DerivClient instance (optional).
+            exclude_symbol: Symbol to exclude from winner selection (e.g. following a loss).
+            
         Returns:
             Tuple of (top_symbol: str, top_pct: float, all_results: Dict[str, MarketMomentum])
         """
-        logger.info(f"🔍 [SCANNER] Scanning 5-minute momentum across {len(self.symbols)} indices: {self.symbols}...")
+        exclude_info = f" (Excluding previous market: {exclude_symbol})" if exclude_symbol else ""
+        logger.info(f"🔍 [SCANNER] Scanning 5-minute momentum across {len(self.symbols)} indices{exclude_info}...")
         results: Dict[str, MarketMomentum] = {}
 
         if client and client.is_connected:
@@ -127,19 +134,25 @@ class MultiMarketScanner:
 
         # Format and log the ranking
         sorted_results = sorted(results.values(), key=lambda m: m.pct_change, reverse=True)
-        top = sorted_results[0]
+        
+        # Select top symbol (excluding previous losing market if requested)
+        eligible = [m for m in sorted_results if m.symbol != exclude_symbol]
+        top = eligible[0] if eligible else sorted_results[0]
         self.active_symbol = top.symbol
 
         logger.info("=" * 72)
         logger.info("📊 5-MINUTE MULTI-MARKET MOMENTUM RANKING (13 VOLATILITY INDICES):")
         for idx, m in enumerate(sorted_results, 1):
-            winner_mark = " 🏆 [WINNER - ACTIVE TARGET]" if m.symbol == top.symbol else ""
+            if m.symbol == top.symbol:
+                winner_mark = " 🏆 [WINNER - ACTIVE TARGET]"
+            elif m.symbol == exclude_symbol:
+                winner_mark = " ⛔ [PREVIOUS LOSS - EXCLUDED]"
+            else:
+                winner_mark = ""
             logger.info(
                 f"   {idx:>2}. {m.symbol:<8} | 5m Move: {m.pct_change:7.4f}% "
                 f"(From {m.price_5m_ago:.{m.pip_size}f} -> {m.current_price:.{m.pip_size}f}){winner_mark}"
             )
         logger.info("=" * 72)
-
-        return top.symbol, top.pct_change, results
 
         return top.symbol, top.pct_change, results

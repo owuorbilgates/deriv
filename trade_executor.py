@@ -11,7 +11,7 @@ Supports:
 import asyncio
 import logging
 import random
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Coroutine, Dict, Optional
 
 from config import TradingConfig
 from deriv_client import DerivClient
@@ -43,6 +43,9 @@ class TradeExecutor:
         
         # Simulated/Paper contract tracking
         self._simulated_trades: Dict[str, Dict[str, Any]] = {}
+        
+        # Callback for trade settlement events (e.g. market re-scan on loss)
+        self.on_trade_settled: Optional[Callable[[TradeOutcome], Coroutine[Any, Any, None]]] = None
 
     async def execute_signal(self, signal: StrategySignal, current_tick: TickData, target_symbol: Optional[str] = None) -> bool:
         """Evaluate and execute a trading signal."""
@@ -170,6 +173,9 @@ class TradeExecutor:
             f"{self.risk_manager.get_summary()}"
         )
 
+        if self.on_trade_settled:
+            asyncio.create_task(self.on_trade_settled(outcome))
+
     # -------------------------------------------------------------------------
     # Local Simulation / Paper-Trading Engine
     # -------------------------------------------------------------------------
@@ -253,3 +259,6 @@ class TradeExecutor:
                     f"Type: {contract_type} | Profit: ${profit:+.2f} | Exit: [{exit_digit}] vs Barrier: [{barrier}] | "
                     f"{self.risk_manager.get_summary()}"
                 )
+
+                if self.on_trade_settled:
+                    await self.on_trade_settled(outcome)

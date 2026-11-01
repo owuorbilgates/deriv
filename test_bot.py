@@ -379,5 +379,118 @@ class TestSeparatedModesAndScanOnLoss(unittest.TestCase):
         self.assertEqual(top.symbol, "1HZ100V")
 
 
+class TestDerivPredictionTableAndThousandTicks(unittest.TestCase):
+    """
+    Verify 1000-tick window sizing, Deriv percentage formatting,
+    and prediction table rendering matching Deriv web platform.
+    """
+
+    def test_default_buffer_size_and_adaptive_thresholds(self):
+        engine_default = StrategyEngine()
+        self.assertEqual(engine_default.buffer_size, 1000)
+        self.assertEqual(engine_default.differs_cold_threshold, 9.0)
+        self.assertEqual(engine_default.match_hot_threshold, 11.5)
+
+        engine_small = StrategyEngine(buffer_size=100)
+        self.assertEqual(engine_small.buffer_size, 100)
+        self.assertEqual(engine_small.differs_cold_threshold, 2.0)
+        self.assertEqual(engine_small.match_hot_threshold, 19.0)
+
+    def test_deriv_percentage_formatting(self):
+        # Deriv format: integers for whole numbers, 1 decimal place otherwise
+        self.assertEqual(StrategyEngine.format_deriv_percentage(9.0), "9%")
+        self.assertEqual(StrategyEngine.format_deriv_percentage(10.2), "10.2%")
+        self.assertEqual(StrategyEngine.format_deriv_percentage(10.6), "10.6%")
+        self.assertEqual(StrategyEngine.format_deriv_percentage(12.3), "12.3%")
+        self.assertEqual(StrategyEngine.format_deriv_percentage(9.6), "9.6%")
+        self.assertEqual(StrategyEngine.format_deriv_percentage(0.0), "0%")
+
+    def test_deriv_prediction_table_matches_user_distribution(self):
+        # User's exact pasted distribution:
+        # 0: 9%, 1: 10.2%, 2: 9%, 3: 10.6%, 4: 9.6%, 5: 10.2%, 6: 9.7%, 7: 9.8%, 8: 9.6%, 9: 12.3%
+        # Sum = 90 + 102 + 90 + 106 + 96 + 102 + 97 + 98 + 96 + 123 = 1000 ticks
+        counts = {
+            0: 90, 1: 102, 2: 90, 3: 106, 4: 96,
+            5: 102, 6: 97, 7: 98, 8: 96, 9: 123
+        }
+        self.assertEqual(sum(counts.values()), 1000)
+
+        engine = StrategyEngine(buffer_size=1000)
+        ticks = []
+        epoch = 1000
+        for digit, count in counts.items():
+            for _ in range(count):
+                epoch += 1
+                ticks.append(TickData(
+                    symbol="R_100",
+                    quote=float(f"1234.{digit}"),
+                    pip_size=2,
+                    last_digit=digit,
+                    epoch=epoch
+                ))
+        engine.seed_history(ticks)
+
+        table = engine.get_deriv_prediction_table("R_100")
+        self.assertIn("DERIV LAST DIGIT PREDICTION (1000/1000 Ticks) - R_100", table)
+        self.assertIn("9%", table)
+        self.assertIn("10.2%", table)
+        self.assertIn("12.3%", table)
+        self.assertIn("HOT", table)  # Digit 9 (12.3% >= 11.5%) is hot
+
+    def test_thousand_ticks_differs_trigger(self):
+        # In 1000 ticks, cold threshold is <= 9.0%.
+        # Digits 0 and 2 are 90/1000 = 9.0%. Differs should trigger on digit 0 (coldest).
+        counts = {
+            0: 90, 1: 102, 2: 90, 3: 106, 4: 96,
+            5: 102, 6: 97, 7: 98, 8: 96, 9: 123
+        }
+        engine = StrategyEngine(buffer_size=1000, strategy_mode="DIFFERS")
+        ticks = []
+        epoch = 1000
+        for digit, count in counts.items():
+            for _ in range(count):
+                epoch += 1
+                ticks.append(TickData(
+                    symbol="R_100",
+                    quote=float(f"1234.{digit}"),
+                    pip_size=2,
+                    last_digit=digit,
+                    epoch=epoch
+                ))
+        engine.seed_history(ticks)
+
+        signal = engine.evaluate_strategy(engine.tick_history)
+        self.assertEqual(signal.signal_type, SignalType.DIGITDIFF)
+        self.assertEqual(signal.predicted_barrier, 0)
+        self.assertIn("cold", signal.reason.lower())
+
+    def test_thousand_ticks_match_trigger(self):
+        # In 1000 ticks, hot threshold is >= 11.5%.
+        # Digit 9 is 123/1000 = 12.3%. Match should trigger on digit 9.
+        counts = {
+            0: 90, 1: 102, 2: 90, 3: 106, 4: 96,
+            5: 102, 6: 97, 7: 98, 8: 96, 9: 123
+        }
+        engine = StrategyEngine(buffer_size=1000, strategy_mode="MATCH")
+        ticks = []
+        epoch = 1000
+        for digit, count in counts.items():
+            for _ in range(count):
+                epoch += 1
+                ticks.append(TickData(
+                    symbol="R_100",
+                    quote=float(f"1234.{digit}"),
+                    pip_size=2,
+                    last_digit=digit,
+                    epoch=epoch
+                ))
+        engine.seed_history(ticks)
+
+        signal = engine.evaluate_strategy(engine.tick_history)
+        self.assertEqual(signal.signal_type, SignalType.DIGITMATCH)
+        self.assertEqual(signal.predicted_barrier, 9)
+        self.assertIn("hot", signal.reason.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

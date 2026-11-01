@@ -225,7 +225,7 @@ class DerivTradingBot:
                     break
 
     async def _seed_market_history(self, symbol: str) -> None:
-        """Pre-fill 100-tick window immediately using real Deriv historical ticks."""
+        """Pre-fill window immediately using real Deriv historical ticks."""
         try:
             self.logger.info(f"📥 Loading real Deriv historical ticks ({self.config.DIGIT_WINDOW_SIZE} ticks) for [{symbol}]...")
             res = await self.client.fetch_ticks_history(symbol, count=self.config.DIGIT_WINDOW_SIZE)
@@ -247,8 +247,8 @@ class DerivTradingBot:
 
             self.strategy.seed_history(ticks)
             self.logger.info(
-                f"✅ Pre-seeded {len(ticks)} real ticks for [{symbol}] (pip_size={pip_size}). "
-                f"{self.strategy.get_distribution_summary()}"
+                f"✅ Pre-seeded {len(ticks)} real ticks for [{symbol}] (pip_size={pip_size}).\n"
+                f"{self.strategy.get_deriv_prediction_table(symbol)}"
             )
         except Exception as e:
             self.logger.warning(f"Failed to pre-seed tick history for {symbol}: {e}")
@@ -492,10 +492,11 @@ def parse_arguments() -> argparse.Namespace:
     # Strategy & parameters
     parser.add_argument("--mode", "-m", choices=["DIFFERS", "MATCH", "1", "2"], help="Strategy: [1] DIFFERS or [2] MATCH")
     parser.add_argument("--match-cap", type=int, default=2, help="Max Match trades before reverting to Differs (default: 2)")
+    parser.add_argument("--window-size", "--ticks", type=int, help="Rolling digit history window size (default: 1000 ticks to match Deriv platform)")
     parser.add_argument("--symbol", type=str, help="Initial Volatility Index (e.g. R_100)")
     parser.add_argument("--stake", type=float, help="Base stake amount in USD (default: 0.35)")
-    parser.add_argument("--differs-threshold", type=float, help="Cold digit %% threshold for DIFFERS (default: 2.0)")
-    parser.add_argument("--match-threshold", type=float, help="Hot digit %% threshold for MATCH (default: 19.0)")
+    parser.add_argument("--differs-threshold", type=float, help="Cold digit %% threshold for DIFFERS (default: 9.0 for 1000 ticks, 2.0 for 100 ticks)")
+    parser.add_argument("--match-threshold", type=float, help="Hot digit %% threshold for MATCH (default: 11.5 for 1000 ticks, 19.0 for 100 ticks)")
     parser.add_argument("--threshold", type=float, help="Legacy alias for --match-threshold")
     parser.add_argument("--blacklist-trades", type=int, help="Quarantine duration on losing digit (default: 10)")
     parser.add_argument("--static-mode", action="store_true", help="Disable dynamic mode switching")
@@ -521,6 +522,8 @@ async def main() -> None:
     else:
         selected_mode = prompt_strategy_choice(CONFIG.STRATEGY_MODE)
     overrides["STRATEGY_MODE"] = selected_mode
+    if args.window_size:
+        overrides["DIGIT_WINDOW_SIZE"] = args.window_size
     if args.match_cap:
         overrides["MATCH_MAX_ATTEMPTS"] = args.match_cap
     if args.symbol:

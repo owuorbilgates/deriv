@@ -64,20 +64,31 @@ class TradingConfig:
     # In Match recovery mode (if dynamic switch enabled), strictly cap at 2 trades
     MATCH_MAX_ATTEMPTS: int = int(os.getenv("DERIV_MATCH_MAX_ATTEMPTS", "2"))
     
-    # Rolling tick history window size
-    DIGIT_WINDOW_SIZE: int = int(os.getenv("DERIV_DIGIT_WINDOW_SIZE", "100"))
+    # Rolling tick history window size (1000 ticks matches Deriv platform Last Digit Prediction exactly)
+    DIGIT_WINDOW_SIZE: int = int(os.getenv("DERIV_DIGIT_WINDOW_SIZE", "1000"))
     
     # -------------------------------------------------------------------------
     # Decoupled Triggers for DIFFERS and MATCH
     # -------------------------------------------------------------------------
-    # 1. DIFFERS: Cold Digit Trigger (Bet DIFFERS on cold digits appearing <= 2.0%)
-    DIFFERS_COLD_THRESHOLD_PERCENT: float = float(os.getenv("DERIV_DIFFERS_COLD_THRESHOLD", "2.0"))
+    # Calibrated for 1000 ticks (mean 10.0%, 1 sigma = 0.95%):
+    # - DIFFERS: Cold Digit Trigger (Bet DIFFERS on cold digits appearing <= 9.0% in 1000 ticks)
+    # - MATCH: Hot Digit Trigger (Bet MATCH on hot digits appearing >= 11.5% in 1000 ticks)
+    DIFFERS_COLD_THRESHOLD_PERCENT: float = float(
+        os.getenv(
+            "DERIV_DIFFERS_COLD_THRESHOLD",
+            "9.0" if int(os.getenv("DERIV_DIGIT_WINDOW_SIZE", "1000")) >= 500 else "2.0"
+        )
+    )
     
-    # 2. MATCH: Hot Digit Trigger (Bet MATCH on hot digits appearing >= 19.0%)
-    MATCH_HOT_THRESHOLD_PERCENT: float = float(os.getenv("DERIV_MATCH_HOT_THRESHOLD", "19.0"))
+    MATCH_HOT_THRESHOLD_PERCENT: float = float(
+        os.getenv(
+            "DERIV_MATCH_HOT_THRESHOLD",
+            "11.5" if int(os.getenv("DERIV_DIGIT_WINDOW_SIZE", "1000")) >= 500 else "19.0"
+        )
+    )
     
     # Legacy alias
-    DIGIT_THRESHOLD_PERCENT: float = float(os.getenv("DERIV_DIGIT_THRESHOLD", "19.0"))
+    DIGIT_THRESHOLD_PERCENT: float = float(os.getenv("DERIV_DIGIT_THRESHOLD", "11.5"))
     
     # Anti-Revenge Blacklist: Number of trades to quarantine a losing digit
     DIGIT_BLACKLIST_TRADES: int = int(os.getenv("DERIV_DIGIT_BLACKLIST_TRADES", "10"))
@@ -134,10 +145,10 @@ class TradingConfig:
             raise ValueError("Stop loss and take profit limits must be positive numbers.")
         if self.DIGIT_WINDOW_SIZE < 10:
             raise ValueError("DIGIT_WINDOW_SIZE must be at least 10 ticks.")
-        if self.DIFFERS_COLD_THRESHOLD_PERCENT < 0.0 or self.DIFFERS_COLD_THRESHOLD_PERCENT > 10.0:
-            raise ValueError("DIFFERS_COLD_THRESHOLD_PERCENT must be between 0.0% and 10.0%.")
-        if self.MATCH_HOT_THRESHOLD_PERCENT < 10.0 or self.MATCH_HOT_THRESHOLD_PERCENT > 100.0:
-            raise ValueError("MATCH_HOT_THRESHOLD_PERCENT must be between 10.0% and 100.0%.")
+        if self.DIFFERS_COLD_THRESHOLD_PERCENT < 0.0 or self.DIFFERS_COLD_THRESHOLD_PERCENT > 50.0:
+            raise ValueError("DIFFERS_COLD_THRESHOLD_PERCENT must be between 0.0% and 50.0%.")
+        if self.MATCH_HOT_THRESHOLD_PERCENT < 5.0 or self.MATCH_HOT_THRESHOLD_PERCENT > 100.0:
+            raise ValueError("MATCH_HOT_THRESHOLD_PERCENT must be between 5.0% and 100.0%.")
         if self.MATCH_MAX_ATTEMPTS < 1:
             raise ValueError("MATCH_MAX_ATTEMPTS must be at least 1.")
 

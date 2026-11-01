@@ -60,9 +60,9 @@ class StrategyEngine:
 
     def __init__(
         self,
-        buffer_size: int = 100,
-        differs_cold_threshold: float = 3.0,
-        match_hot_threshold: float = 19.0,
+        buffer_size: int = 1000,
+        differs_cold_threshold: Optional[float] = None,
+        match_hot_threshold: Optional[float] = None,
         strategy_mode: str = "DIFFERS",
         blacklist_duration_trades: int = 10,
         dynamic_mode_switch: bool = False,
@@ -73,9 +73,9 @@ class StrategyEngine:
         Initialize decoupled strategy engine.
         
         Args:
-            buffer_size: Rolling window size (default: 100 ticks).
-            differs_cold_threshold: Max occurrence % for cold digit in DIFFERS mode (default: 2.0%).
-            match_hot_threshold: Min occurrence % for hot digit in MATCH mode (default: 19.0%).
+            buffer_size: Rolling window size (default: 1000 ticks to match Deriv platform).
+            differs_cold_threshold: Max occurrence % for cold digit in DIFFERS mode (default: 9.0% for >=500 ticks, 2.0% for <500).
+            match_hot_threshold: Min occurrence % for hot digit in MATCH mode (default: 11.5% for >=500 ticks, 19.0% for <500).
             strategy_mode: Starting mode ("DIFFERS" or "MATCH").
             blacklist_duration_trades: Number of trades to quarantine a losing digit.
             dynamic_mode_switch: If True, switches to MATCH on loss, and back to DIFFERS on win or 2 losses.
@@ -83,13 +83,26 @@ class StrategyEngine:
             threshold_percent: Legacy parameter (maps to match_hot_threshold if provided).
         """
         self.buffer_size = buffer_size
-        self.differs_cold_threshold = differs_cold_threshold
-        self.match_hot_threshold = threshold_percent if threshold_percent is not None else match_hot_threshold
+        
+        # Adaptive thresholds: calibrated automatically to window sample size
+        if differs_cold_threshold is not None:
+            self.differs_cold_threshold = differs_cold_threshold
+        else:
+            self.differs_cold_threshold = 9.0 if buffer_size >= 500 else 2.0
+            
+        if threshold_percent is not None:
+            self.match_hot_threshold = threshold_percent
+        elif match_hot_threshold is not None:
+            self.match_hot_threshold = match_hot_threshold
+        else:
+            self.match_hot_threshold = 11.5 if buffer_size >= 500 else 19.0
+            
         # Legacy alias for backward compatibility
         self.threshold_percent = self.match_hot_threshold
         
         self.strategy_mode = strategy_mode.upper()
         self.blacklist_duration = blacklist_duration_trades
+        dynamic_mode_switch = dynamic_mode_switch
         self.dynamic_mode_switch = dynamic_mode_switch
         self.max_match_attempts = max_match_attempts
         
@@ -377,6 +390,17 @@ class StrategyEngine:
                 distribution=distribution
             )
 
+    @staticmethod
+    def format_deriv_percentage(pct: float) -> str:
+        """
+        Format percentage string identically to the Deriv platform Last Digit Prediction widget.
+        E.g.: 9.0 -> '9%', 10.2 -> '10.2%', 12.3 -> '12.3%'.
+        """
+        rounded = round(pct, 1)
+        if rounded.is_integer():
+            return f"{int(rounded)}%"
+        return f"{rounded:.1f}%"
+
     def get_distribution_summary(self) -> str:
         """Return formatted distribution summary showing active mode and blacklist."""
         mode_tag = (
@@ -402,7 +426,7 @@ class StrategyEngine:
                 mark = "*"  # Cold trigger candidate for Differs
             elif self.strategy_mode == "MATCH" and pct >= self.match_hot_threshold:
                 mark = "*"  # Hot trigger candidate for Match
-            items.append(f"{d}:{pct:.0f}%{mark}")
+            items.append(f"{d}:{self.format_deriv_percentage(pct)}{mark}")
             
         bl_info = ""
         if self.digit_blacklist:
@@ -410,3 +434,46 @@ class StrategyEngine:
             bl_info = f" | Blacklist: [{bl_str}]"
             
         return f"[{mode_tag}] Digits ({total} ticks): [{' '.join(items)}]{bl_info}"
+
+    def get_deriv_prediction_table(self, symbol: str = "") -> str:
+        """
+        Generate a formatted prediction table matching Deriv's Last Digit Prediction widget.
+        Displays count and percentage for digits 0-9 with cold/hot indicator tags.
+        """
+        if not self.tick_history:
+            return f"No tick history available for {symbol} (Window: {self.buffer_size} ticks)"
+
+        digits = [t.last_digit for t in self.tick_history]
+        total = len(digits)
+        freq = Counter(digits)
+
+        sym_tag = f" - {symbol}" if symbol else ""
+        lines = [
+            f"============================================================",
+            f"📊 DERIV LAST DIGIT PREDICTION ({total}/{self.buffer_size} Ticks){sym_tag}",
+            f"============================================================",
+            f" Digit | Occurrences | Percentage | Status",
+            f"------------------------------------------------------------"
+        ]
+
+        for d in range(10):
+            cnt = freq.get(d, 0)
+            pct = (cnt / total) * 100.0 if total > 0 else 0.0
+            pct_str = self.format_deriv_percentage(pct)
+
+            status = ""
+            if d in self.digit_blacklist:
+                status = f"🚫 Quarantined ({self.digit_blacklist[d]} trades left)"
+            elif self.strategy_mode == "DIFFERS" and pct <= self.differs_cold_threshold:
+                status = f"❄️  COLD (<= {self.differs_cold_threshold:.1f}%) -> DIFFERS TARGET"
+            elif self.strategy_mode == "MATCH" and pct >= self.match_hot_threshold:
+                status = f"🔥 HOT (>= {self.match_hot_threshold:.1f}%) -> MATCH TARGET"
+            elif pct <= self.differs_cold_threshold:
+                status = f"❄️  COLD (<= {self.differs_cold_threshold:.1f}%)"
+            elif pct >= self.match_hot_threshold:
+                status = f"🔥 HOT (>= {self.match_hot_threshold:.1f}%)"
+
+            lines.append(f"   {d}   |    {cnt:>4}     |    {pct_str:>6}   | {status}")
+
+        lines.append(f"============================================================")
+        return "\n".join(lines)
